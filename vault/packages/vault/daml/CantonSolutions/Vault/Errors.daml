@@ -1,0 +1,121 @@
+-- | Named failures. Every id starts with `canton-solutions/vault-`, so clients
+-- can match on the id instead of the message.
+module CantonSolutions.Vault.Errors where
+
+import DA.Fail (FailureCategory (..), FailureStatus (..))
+import DA.TextMap qualified as TextMap
+
+-- | A failure that no later ledger state can fix.
+invalid : Text -> FailureStatus
+invalid = failure InvalidIndependentOfSystemState
+
+-- | A failure caused by the current ledger state or time.
+stale : Text -> FailureStatus
+stale = failure InvalidGivenCurrentSystemStateOther
+
+failure : FailureCategory -> Text -> FailureStatus
+failure category name = FailureStatus with
+  errorId = "canton-solutions/vault-" <> name
+  category
+  message = "vault: " <> name
+  meta = TextMap.empty
+
+withMeta : [(Text, Text)] -> FailureStatus -> FailureStatus
+withMeta pairs status = status with meta = TextMap.fromList pairs
+
+timed : Text -> Time -> Time -> FailureStatus
+timed name deadline now = withMeta [("deadline", show deadline), ("now", show now)] (stale name)
+
+-- Opening the vault
+
+eShareRegistryNotCustodian = invalid "share-registry-not-custodian"
+eShareLifetimeTooShort = stale "share-lifetime-too-short"
+
+-- Factories
+
+eAllocatorAdminMismatch = invalid "allocator-admin-mismatch"
+eSettlerAdminMismatch = invalid "settler-admin-mismatch"
+eAllocationIncomplete = stale "allocation-incomplete"
+eSettlementIncomplete = stale "settlement-incomplete"
+eSettlementResultsIncomplete = stale "settlement-results-incomplete"
+eUnexpectedChange = stale "unexpected-change"
+
+-- Orders
+
+eOrderExpired : Time -> Time -> FailureStatus
+eOrderExpired = timed "order-expired"
+
+eAbandonBeforeDeadline : Time -> Time -> FailureStatus
+eAbandonBeforeDeadline = timed "abandon-before-deadline"
+
+eWithdrawBeforeDeadline : Time -> Time -> FailureStatus
+eWithdrawBeforeDeadline = timed "withdraw-before-deadline"
+
+eWithdrawIncomplete = stale "withdraw-incomplete"
+eOrderWrongCustodian = invalid "order-wrong-custodian"
+eOrderWrongManager = invalid "order-wrong-manager"
+eHolderIsCustodian = invalid "holder-is-custodian"
+eBadAmount = invalid "bad-amount"
+eBadOrderTime = invalid "bad-order-time"
+eOrderLifetimeExceeded = stale "order-lifetime-exceeded"
+eWrongSponsor = invalid "wrong-sponsor"
+
+-- Allocations behind orders
+
+eAllocationAdminMismatch : Party -> Party -> FailureStatus
+eAllocationAdminMismatch expected actual =
+  withMeta [("expected", partyToText expected), ("actual", partyToText actual)]
+    (invalid "allocation-admin-mismatch")
+
+eAllocationWrongAuthorizer = invalid "allocation-wrong-authorizer"
+eAllocationWrongExecutor = invalid "allocation-wrong-executor"
+eAllocationIterated = invalid "allocation-iterated"
+eAllocationNotCommitted = invalid "allocation-not-committed"
+eAllocationDeadlineMismatch = invalid "allocation-deadline-mismatch"
+eAllocationLifetimeExceeded = stale "allocation-lifetime-exceeded"
+eAllocationExpiresEarly = invalid "allocation-expires-early"
+eLegCount = invalid "leg-count"
+eLegWrongSide = invalid "leg-wrong-side"
+eLegWrongInstrument = invalid "leg-wrong-instrument"
+eLegWrongReceiver = invalid "leg-wrong-receiver"
+eLegWrongAmount = invalid "leg-wrong-amount"
+
+-- Batches
+
+eBatcherIsCustodian = invalid "batcher-is-custodian"
+eEmptyBatch = invalid "empty-batch"
+eDuplicateOrder = invalid "duplicate-order"
+eLedgerMismatch = invalid "ledger-mismatch"
+eReserveMismatch = stale "reserve-mismatch"
+eClosingReserveMismatch = stale "closing-reserve-mismatch"
+
+-- Pricing
+
+eBadPriceInput = invalid "bad-price-input"
+eZeroOutput = stale "zero-output"
+ePartialLastExit = stale "partial-last-exit"
+eTopUpWithoutShares = stale "top-up-without-shares"
+
+eBelowMinShares : Decimal -> Decimal -> FailureStatus
+eBelowMinShares minimum quote =
+  withMeta [("minimum", show minimum), ("quote", show quote)] (stale "below-min-shares")
+
+eBelowMinAssets : Decimal -> Decimal -> FailureStatus
+eBelowMinAssets minimum quote =
+  withMeta [("minimum", show minimum), ("quote", show quote)] (stale "below-min-assets")
+
+-- Settlement checks
+
+eWrongAssetReceipt = stale "wrong-asset-receipt"
+eWrongShareMint = stale "wrong-share-mint"
+eWrongPayout = stale "wrong-payout"
+eWrongReserveChange = stale "wrong-reserve-change"
+
+-- Holdings
+
+eHoldingDuplicate = invalid "holding-duplicate"
+eHoldingWrongInstrument = invalid "holding-wrong-instrument"
+eHoldingWrongOwner = invalid "holding-wrong-owner"
+eHoldingLocked = stale "holding-locked"
+eHoldingUnsigned = invalid "holding-unsigned"
+eHoldingNotPositive = invalid "holding-not-positive"

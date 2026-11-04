@@ -1,0 +1,228 @@
+-- | A fresh world per test: parties, two real CIP-0112 token registries, an
+-- open vault and the three roles.
+module CantonSolutions.Vault.Test.Setup where
+
+import DA.Assert ((===))
+import DA.Date (Month (Jan), date)
+import DA.Optional (isNone)
+import DA.Text qualified as Text
+import DA.Time (addRelTime, hours, minutes, time)
+
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocInstr
+import Splice.Api.Token.AllocationV2 qualified as A
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils (basicAccount, burnAccount, senderSide)
+
+import CantonSolutions.Token
+
+import CantonSolutions.Vault.Manager
+import CantonSolutions.Vault.Roles
+import CantonSolutions.Vault.Settlement (noArgs)
+
+t0 : Time
+t0 = time (date 2026 Jan 1) 0 0 0
+
+data World = World with
+    registrar : Party
+      -- ^ Admin of the underlying token.
+    custodian : Party
+    batcher : Party
+    sponsor : Party
+    warden : Party
+      -- ^ Holds the halt and resume roles.
+    alice : Party
+    bob : Party
+    underlyingRules : ContractId TokenRules
+    shareRules : ContractId TokenRules
+    terms : VaultTerms
+    manager : ContractId VaultManager
+    ledger : ContractId VaultLedger
+    batchRole : Authorization
+    haltRole : Authorization
+    resumeRole : Authorization
+
+world : Script World
+world = do
+  registrar <- allocateParty "registrar"
+  custodian <- allocateParty "custodian"
+  batcher <- allocateParty "batcher"
+  sponsor <- allocateParty "sponsor"
+  warden <- allocateParty "warden"
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  setTime t0
+  underlyingRules <- submit registrar do
+    createCmd TokenRules with admin = registrar; maxLifetime = hours 1
+  shareRules <- submit custodian do
+    createCmd TokenRules with admin = custodian; maxLifetime = hours 1
+  let terms = VaultTerms with
+        custodian
+        sponsor
+        underlying = H.InstrumentId registrar "USD"
+        underlyingAllocator = toInterfaceContractId @AllocInstr.AllocationFactory underlyingRules
+        underlyingSettler = toInterfaceContractId @A.SettlementFactory underlyingRules
+        shareRegistry = shareRules
+        shareId = "vUSD"
+        orderLifetime = minutes 10
+        underlyingLifetime = hours 1
+  manager <- submit custodian do createCmd VaultManager with terms
+  ledger <- submit custodian do exerciseCmd manager VaultManager_Open
+  batchRole <- giveRole custodian manager batcher "batch"
+  haltRole <- giveRole custodian manager warden "halt"
+  resumeRole <- giveRole custodian manager warden "resume"
+  pure World with ..
+
+-- | Everyone's read rights, so a submission can see any order or allocation.
+everyone : World -> [Party]
+everyone w = [w.custodian, w.registrar, w.alice, w.bob, w.sponsor]
+
+-- | Faucet for the underlying. Shares only come from deposits.
+mintUnderlying : World -> Party -> Decimal -> Script (ContractId H.Holding)
+mintUnderlying w owner amount = do
+  cid <- submit (actAs w.registrar <> actAs owner) do
+    createCmd TokenHolding with admin = w.registrar; owner; instrument = "USD"; amount; lock = None
+  pure (toInterfaceContractId @H.Holding cid)
+
+-- | One committed sender leg of `amount` to `receiver`.
+lockSpec : Party -> Party -> H.Account -> Text -> Decimal -> Time -> A.AllocationSpecification
+lockSpec admin owner receiver instrument amount deadline = A.AllocationSpecification with
+  admin
+  authorizer = basicAccount owner
+  transferLegSides =
+    [senderSide (A.TransferLeg "input" (basicAccount owner) receiver amount instrument emptyMetadata)]
+  settlementDeadline = Some deadline
+  nextIterationFunding = None
+  committed = True
+  meta = emptyMetadata
+
+-- | Allocate through `factory` with the custodian as executor.
+lockInput
+  : World -> Party -> ContractId TokenRules -> A.AllocationSpecification
+  -> [ContractId H.Holding] -> Text -> Script (ContractId A.Allocation)
+lockInput w owner factory spec inputs label = do
+  now <- getTime
+  result <- submit (actAs owner <> readAs w.registrar <> readAs w.custodian) do
+    exerciseCmd (toInterfaceContractId @AllocInstr.AllocationFactory factory) AllocInstr.AllocationFactory_Allocate with
+      settlement = A.SettlementInfo [w.custodian] label None emptyMetadata
+      allocation = spec
+      requestedAt = now
+      inputHoldingCids = inputs
+      actors = [owner]
+      extraArgs = noArgs
+  case result.output of
+    AllocInstr.AllocationInstructionResult_Completed cid -> pure cid
+    _ -> abort "allocation did not complete"
+
+-- | Mint `amount` of the underlying to `owner` and lock it for the custodian.
+lockUnderlying : World -> Party -> Decimal -> Time -> Text -> Script (ContractId A.Allocation)
+lockUnderlying w owner amount deadline label = do
+  holding <- mintUnderlying w owner amount
+  lockInput w owner w.underlyingRules
+    (lockSpec w.registrar owner (basicAccount w.custodian) "USD" amount deadline) [holding] label
+
+-- | Orders in the tests live for five minutes.
+fiveMinutesFromNow : () -> Script Time
+fiveMinutesFromNow () = (`addRelTime` minutes 5) <$> getTime
+
+placeDeposit : World -> Party -> Decimal -> Decimal -> Text -> Script (ContractId DepositOrder)
+placeDeposit w holder amount minShares label = do
+  deadline <- fiveMinutesFromNow ()
+  allocation <- lockUnderlying w holder amount deadline label
+  submit (actAs holder <> readAs w.custodian <> readAs w.registrar) do
+    exerciseCmd w.manager VaultManager_PlaceDeposit with holder; allocation; amount; minShares; deadline
+
+placeTopUp : World -> Decimal -> Text -> Script (ContractId TopUpOrder)
+placeTopUp w amount label = do
+  deadline <- fiveMinutesFromNow ()
+  allocation <- lockUnderlying w w.sponsor amount deadline label
+  submit (actAs w.sponsor <> readAs w.custodian <> readAs w.registrar) do
+    exerciseCmd w.manager VaultManager_PlaceTopUp with allocation; amount; deadline
+
+placeRedeem : World -> Party -> Decimal -> Decimal -> Text -> Script (ContractId RedeemOrder)
+placeRedeem w holder amount minAssets label = do
+  deadline <- fiveMinutesFromNow ()
+  holdings <- query @TokenHolding holder
+  let inputs =
+        [ toInterfaceContractId @H.Holding cid
+        | (cid, h) <- holdings
+        , h.owner == holder, h.admin == w.custodian, h.instrument == "vUSD"
+        , isNone h.lock ]
+  allocation <- lockInput w holder w.shareRules
+    (lockSpec w.custodian holder burnAccount "vUSD" amount deadline) inputs label
+  submit (actAs holder <> readAs w.custodian) do
+    exerciseCmd w.manager VaultManager_PlaceRedeem with holder; allocation; amount; minAssets; deadline
+
+batchCmd : World -> ContractId VaultLedger -> [OrderRef] -> Commands BatchReport
+batchCmd w ledger orders = exerciseCmd w.manager VaultManager_RunBatch with
+  ledger; orders; underlyingArgs = noArgs; authorization = w.batchRole
+
+asBatcher : World -> SubmitOptions
+asBatcher w = actAs w.batcher <> readAs (everyone w)
+
+runBatch : World -> ContractId VaultLedger -> [OrderRef] -> Script BatchReport
+runBatch w ledger orders = submit (asBatcher w) (batchCmd w ledger orders)
+
+-- | The book must match the real tokens: every share holding, locked or not,
+-- adds up to `issuedShares`, and the reserve adds up to `managedAssets`.
+checkBalances : World -> ContractId VaultLedger -> Script Book
+checkBalances w ledger = do
+  Some current <- queryContractId w.custodian ledger
+  holdings <- query @TokenHolding w.custodian
+  let book = current.book
+      shares = sum
+        [ h.amount | (_, h) <- holdings, h.admin == w.custodian, h.instrument == "vUSD" ]
+      reserved = sum
+        [ h.amount | (cid, h) <- holdings, toInterfaceContractId @H.Holding cid `elem` book.reserve ]
+  shares === book.issuedShares
+  reserved === book.managedAssets
+  pure book
+
+-- | A custodian-issued role for this manager.
+giveRole : Party -> ContractId VaultManager -> Party -> Text -> Script Authorization
+giveRole authority manager actor permission = do
+  role <- submit authority do
+    createCmd VaultRole with
+      custodian = authority; grantee = actor; vault = coerceContractId manager; permission
+  pure Authorization with actor; role
+
+-- | The command must fail with exactly this error id.
+failsWith : Text -> Script (Either SubmitError a) -> Script ()
+failsWith expected attempt = do
+  result <- attempt
+  case result of
+    Left (FailureStatusError status) -> status.errorId === expected
+    Left err -> abort ("expected " <> expected <> ", got " <> show err)
+    Right _ -> abort ("expected " <> expected <> ", but it succeeded")
+
+-- | Shorthand for a vault error id.
+failsVault : Text -> Script (Either SubmitError a) -> Script ()
+failsVault name = failsWith ("canton-solutions/vault-" <> name)
+
+-- | The command must fail on a contract that is already gone.
+failsMissing : Script (Either SubmitError a) -> Script ()
+failsMissing attempt = do
+  result <- attempt
+  case result of
+    Left ContractNotFound {} -> pure ()
+    Left err -> abort ("expected a missing contract, got " <> show err)
+    Right _ -> abort "a spent contract was accepted"
+
+-- | The command must fail with a native error mentioning `fragment`.
+failsNative : Text -> Script (Either SubmitError a) -> Script ()
+failsNative fragment attempt = do
+  result <- attempt
+  case result of
+    Left err -> assertMsg ("unexpected failure " <> show err) (Text.isInfixOf fragment (show err))
+    Right _ -> abort "expected a native failure"
+
+-- | The command must fail for missing authorization.
+failsAuth : Script (Either SubmitError a) -> Script ()
+failsAuth attempt = do
+  result <- attempt
+  case result of
+    Left (AuthorizationError _) -> pure ()
+    Left err -> abort ("expected an authorization failure, got " <> show err)
+    Right _ -> abort "expected an authorization failure"

@@ -1,0 +1,97 @@
+-- | Roles: checks, revocation and handing a role to someone else.
+module CantonSolutions.Vault.Test.Roles where
+
+import DA.Assert ((===))
+
+import Daml.Script
+
+import CantonSolutions.Vault.Manager
+import CantonSolutions.Vault.Roles
+import CantonSolutions.Vault.Settlement (noArgs)
+import CantonSolutions.Vault.Test.Setup
+
+-- | Issuer, grantee, permission and vault are each checked.
+testRoleChecks : Script ()
+testRoleChecks = script do
+  w <- world
+  d <- placeDeposit w w.alice 1.0 0.0 "roles"
+  let tryWith role = trySubmit (asBatcher w) do
+        exerciseCmd w.manager VaultManager_RunBatch with
+          ledger = w.ledger; orders = [DepositRef d]; underlyingArgs = noArgs
+          authorization = Authorization w.batcher role.role
+  failsAuth $ trySubmit w.batcher do
+    createCmd VaultRole with
+      custodian = w.custodian; grantee = w.batcher; vault = coerceContractId w.manager; permission = "batch"
+  byBob <- giveRole w.bob w.manager w.batcher "batch"
+  failsVault "role-wrong-custodian" (tryWith byBob)
+  forBob <- giveRole w.custodian w.manager w.bob "batch"
+  failsVault "role-wrong-grantee" (tryWith forBob)
+  forHalt <- giveRole w.custodian w.manager w.batcher "halt"
+  failsVault "role-wrong-scope" (tryWith forHalt)
+  other <- submit w.custodian do createCmd VaultManager with terms = w.terms
+  forOther <- giveRole w.custodian other w.batcher "batch"
+  failsVault "role-wrong-scope" (tryWith forOther)
+  _ <- checkBalances w w.ledger
+  report <- runBatch w w.ledger [DepositRef d]
+  _ <- checkBalances w report.ledger
+  pure ()
+
+-- | Revoking the batch role and giving it to Bob swaps the batcher, with the
+-- same manager and ledger history.
+testReplaceBatcher : Script ()
+testReplaceBatcher = script do
+  w <- world
+  d <- placeDeposit w w.alice 2.0 0.0 "first"
+  first <- runBatch w w.ledger [DepositRef d]
+  _ <- checkBalances w first.ledger
+  again <- placeDeposit w w.alice 1.0 0.0 "reuse"
+  second <- runBatch w first.ledger [DepositRef again]
+  _ <- checkBalances w second.ledger
+  Some _ <- queryContractId w.batcher w.batchRole.role
+  failsAuth $ trySubmit (actAs w.batcher <> readAs w.custodian) do
+    exerciseCmd w.batchRole.role VaultRole_Revoke
+  submit w.custodian do exerciseCmd w.batchRole.role VaultRole_Revoke
+  waiting <- placeDeposit w w.alice 1.0 0.0 "during-handover"
+  failsMissing $ trySubmit (asBatcher w) (batchCmd w second.ledger [DepositRef waiting])
+  bobRole <- giveRole w.custodian w.manager w.bob "batch"
+  let asBob = w with batcher = w.bob; batchRole = bobRole
+  report <- runBatch asBob second.ledger [DepositRef waiting]
+  book <- checkBalances w report.ledger
+  book.managedAssets === 4.0
+  book.issuedShares === 4.0
+  Some current <- queryContractId w.custodian report.ledger
+  current.manager === w.manager
+  submit w.bob do exerciseCmd bobRole.role VaultRole_Renounce
+  afterRenounce <- placeDeposit w w.alice 1.0 0.0 "renounced"
+  failsMissing $ trySubmit (asBatcher asBob) (batchCmd asBob report.ledger [DepositRef afterRenounce])
+  _ <- checkBalances w report.ledger
+  pure ()
+
+-- | Halt and resume are separate roles, and both can move to a new warden.
+testReplaceWarden : Script ()
+testReplaceWarden = script do
+  w <- world
+  wrongPermission <- giveRole w.custodian w.manager w.warden "batch"
+  let asWarden who = actAs who <> readAs w.custodian
+  failsVault "role-wrong-scope" $ trySubmit (asWarden w.warden) do
+    exerciseCmd w.manager VaultManager_Halt with ledger = w.ledger; authorization = wrongPermission
+  halted <- submit (asWarden w.warden) do
+    exerciseCmd w.manager VaultManager_Halt with ledger = w.ledger; authorization = w.haltRole
+  failsVault "role-wrong-scope" $ trySubmit (asWarden w.warden) do
+    exerciseCmd w.manager VaultManager_Resume with ledger = halted; authorization = w.haltRole
+  submit w.custodian do exerciseCmd w.haltRole.role VaultRole_Revoke
+  submit w.custodian do exerciseCmd w.resumeRole.role VaultRole_Revoke
+  failsMissing $ trySubmit (asWarden w.warden) do
+    exerciseCmd w.manager VaultManager_Resume with ledger = halted; authorization = w.resumeRole
+  bobHalt <- giveRole w.custodian w.manager w.bob "halt"
+  bobResume <- giveRole w.custodian w.manager w.bob "resume"
+  live <- submit (asWarden w.bob) do
+    exerciseCmd w.manager VaultManager_Resume with ledger = halted; authorization = bobResume
+  failsMissing $ trySubmit (asWarden w.warden) do
+    exerciseCmd w.manager VaultManager_Halt with ledger = live; authorization = w.haltRole
+  haltedAgain <- submit (asWarden w.bob) do
+    exerciseCmd w.manager VaultManager_Halt with ledger = live; authorization = bobHalt
+  final <- submit (asWarden w.bob) do
+    exerciseCmd w.manager VaultManager_Resume with ledger = haltedAgain; authorization = bobResume
+  _ <- checkBalances w final
+  pure ()

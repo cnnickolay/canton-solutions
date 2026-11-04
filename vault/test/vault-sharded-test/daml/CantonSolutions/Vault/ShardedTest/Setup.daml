@@ -1,0 +1,210 @@
+-- | A fresh sharded vault per test, with real CIP-0112 token registries.
+module CantonSolutions.Vault.ShardedTest.Setup where
+
+import DA.Assert ((===))
+import DA.Date (Month (Jan), date)
+import DA.List (sortOn)
+import DA.Optional (isNone)
+import DA.Time (addRelTime, hours, minutes, time)
+
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocInstr
+import Splice.Api.Token.AllocationV2 qualified as A
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+import Splice.TokenStandard.Utils (basicAccount, burnAccount, senderSide)
+
+import CantonSolutions.Token
+
+import CantonSolutions.Vault.Manager (VaultTerms (..))
+import CantonSolutions.Vault.Roles
+import CantonSolutions.Vault.Settlement (noArgs)
+import CantonSolutions.Vault.Sharded
+
+t0 : Time
+t0 = time (date 2026 Jan 1) 0 0 0
+
+data World = World with
+    registrar : Party
+    custodian : Party
+    batcher : Party
+    sponsor : Party
+    warden : Party
+    alice : Party
+    bob : Party
+    underlyingRules : ContractId TokenRules
+    shareRules : ContractId TokenRules
+    manager : ContractId ShardedManager
+    board : ContractId PriceBoard
+    shards : [ContractId Shard]
+    batchRole : Authorization
+    foldRole : Authorization
+    haltRole : Authorization
+    resumeRole : Authorization
+
+world : Int -> Script World
+world count = do
+  registrar <- allocateParty "registrar"
+  custodian <- allocateParty "custodian"
+  batcher <- allocateParty "batcher"
+  sponsor <- allocateParty "sponsor"
+  warden <- allocateParty "warden"
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  setTime t0
+  underlyingRules <- submit registrar do
+    createCmd TokenRules with admin = registrar; maxLifetime = hours 1
+  shareRules <- submit custodian do
+    createCmd TokenRules with admin = custodian; maxLifetime = hours 1
+  let terms = VaultTerms with
+        custodian; sponsor
+        underlying = H.InstrumentId registrar "USD"
+        underlyingAllocator = toInterfaceContractId @AllocInstr.AllocationFactory underlyingRules
+        underlyingSettler = toInterfaceContractId @A.SettlementFactory underlyingRules
+        shareRegistry = shareRules
+        shareId = "vUSD"
+        orderLifetime = minutes 10
+        underlyingLifetime = hours 1
+  manager <- submit custodian do
+    createCmd ShardedManager with
+      terms; shardCount = count
+      underlyingTransfers = toInterfaceContractId @T.TransferFactory underlyingRules
+  (board, shards) <- submit custodian do exerciseCmd manager ShardedManager_Open
+  batchRole <- giveRole custodian manager batcher "batch"
+  foldRole <- giveRole custodian manager batcher "fold"
+  haltRole <- giveRole custodian manager warden "halt"
+  resumeRole <- giveRole custodian manager warden "resume"
+  pure World with ..
+
+giveRole : Party -> ContractId ShardedManager -> Party -> Text -> Script Authorization
+giveRole authority manager actor action = do
+  role <- submit authority do
+    createCmd VaultRole with
+      custodian = authority; grantee = actor; vault = coerceContractId manager; permission = action
+  pure Authorization with actor; role
+
+readers : World -> [Party]
+readers w = [w.custodian, w.registrar, w.alice, w.bob, w.sponsor]
+
+asBatcher : World -> SubmitOptions
+asBatcher w = actAs w.batcher <> readAs (readers w)
+
+lockSpec : Text -> Party -> Party -> H.Account -> Text -> Decimal -> Time -> A.AllocationSpecification
+lockSpec label admin owner receiver instrument amount deadline = A.AllocationSpecification with
+  admin
+  authorizer = basicAccount owner
+  transferLegSides =
+    [senderSide (A.TransferLeg label (basicAccount owner) receiver amount instrument emptyMetadata)]
+  settlementDeadline = Some deadline
+  nextIterationFunding = None
+  committed = True
+  meta = emptyMetadata
+
+lockInput : World -> Party -> ContractId TokenRules -> A.AllocationSpecification -> [ContractId H.Holding] -> Script (ContractId A.Allocation)
+lockInput w owner factory spec inputs = do
+  now <- getTime
+  result <- submit (actAs owner <> readAs w.registrar <> readAs w.custodian) do
+    exerciseCmd (toInterfaceContractId @AllocInstr.AllocationFactory factory) AllocInstr.AllocationFactory_Allocate with
+      settlement = vaultSettlement w.custodian w.manager
+      allocation = spec; requestedAt = now; inputHoldingCids = inputs; actors = [owner]; extraArgs = noArgs
+  case result.output of
+    AllocInstr.AllocationInstructionResult_Completed cid -> pure cid
+    _ -> abort "allocation did not complete"
+
+deadlineIn5 : () -> Script Time
+deadlineIn5 () = (`addRelTime` minutes 5) <$> getTime
+
+lockUsd : World -> Text -> Party -> Decimal -> Time -> Script (ContractId A.Allocation)
+lockUsd w label owner amount deadline = do
+  holding <- submit (actAs w.registrar <> actAs owner) do
+    createCmd TokenHolding with admin = w.registrar; owner; instrument = "USD"; amount; lock = None
+  lockInput w owner w.underlyingRules
+    (lockSpec label w.registrar owner (basicAccount w.custodian) "USD" amount deadline) [toInterfaceContractId holding]
+
+placeDeposit : World -> Text -> Party -> Decimal -> Decimal -> Script (ContractId DepositOrder)
+placeDeposit w label holder amount minShares = do
+  deadline <- deadlineIn5 ()
+  allocation <- lockUsd w label holder amount deadline
+  submit (actAs holder <> readAs w.custodian <> readAs w.registrar) do
+    exerciseCmd w.manager ShardedManager_PlaceDeposit with holder; allocation; amount; minShares; deadline
+
+placeTopUp : World -> Text -> Decimal -> Script (ContractId TopUpOrder)
+placeTopUp w label amount = do
+  deadline <- deadlineIn5 ()
+  allocation <- lockUsd w label w.sponsor amount deadline
+  submit (actAs w.sponsor <> readAs w.custodian <> readAs w.registrar) do
+    exerciseCmd w.manager ShardedManager_PlaceTopUp with allocation; amount; deadline
+
+placeRedeem : World -> Text -> Party -> Decimal -> Decimal -> Script (ContractId RedeemOrder)
+placeRedeem w label holder amount minAssets = do
+  deadline <- deadlineIn5 ()
+  holdings <- query @TokenHolding holder
+  let inputs =
+        [ toInterfaceContractId @H.Holding cid | (cid, h) <- holdings
+        , h.owner == holder, h.admin == w.custodian, h.instrument == "vUSD", isNone h.lock ]
+  allocation <- lockInput w holder w.shareRules (lockSpec label w.custodian holder burnAccount "vUSD" amount deadline) inputs
+  submit (actAs holder <> readAs w.custodian) do
+    exerciseCmd w.manager ShardedManager_PlaceRedeem with holder; allocation; amount; minAssets; deadline
+
+batchCmd : World -> ContractId PriceBoard -> ContractId Shard -> [OrderRef] -> Commands ShardReport
+batchCmd w board shard orders = exerciseCmd w.manager ShardedManager_RunBatch with
+  board; shard; orders; underlyingArgs = noArgs; authorization = w.batchRole
+
+runBatch : World -> ContractId PriceBoard -> ContractId Shard -> [OrderRef] -> Script ShardReport
+runBatch w board shard orders = submit (asBatcher w) (batchCmd w board shard orders)
+
+foldCmd : World -> ContractId PriceBoard -> [ContractId Shard] -> [ContractId TopUpOrder] -> [OrderRef] -> Commands FoldReport
+foldCmd w board shards topUps orders = exerciseCmd w.manager ShardedManager_Fold with
+  board; shards; topUps; orders; underlyingArgs = noArgs; authorization = w.foldRole
+
+runFold : World -> ContractId PriceBoard -> [ContractId Shard] -> [ContractId TopUpOrder] -> Script FoldReport
+runFold w board shards topUps = submit (asBatcher w) (foldCmd w board shards topUps [])
+
+-- | Board plus shards must equal the real tokens: the reserves add up to the
+-- shard assets, and all share holdings add up to the board shares plus the
+-- shard deltas. Returns (assets, shares).
+checkBalances : World -> ContractId PriceBoard -> [ContractId Shard] -> Script (Decimal, Decimal)
+checkBalances w board shards = do
+  Some b <- queryContractId w.custodian board
+  found <- forA shards $ \cid -> do
+    Some s <- queryContractId w.custodian cid
+    pure s
+  holdings <- query @TokenHolding w.custodian
+  let reserve = concatMap (.book.reserve) found
+      assets = sum (map (.book.assets) found)
+      shares = b.issuedShares + sum (map (.book.shareDelta) found)
+      reserved = sum [h.amount | (cid, h) <- holdings, toInterfaceContractId @H.Holding cid `elem` reserve]
+      supply = sum [h.amount | (_, h) <- holdings, h.admin == w.custodian, h.instrument == "vUSD"]
+  reserved === assets
+  supply === shares
+  map (.index) (sortOn (.index) found) === [0 .. length shards - 1]
+  pure (assets, shares)
+
+failsWith : Text -> Script (Either SubmitError a) -> Script ()
+failsWith expected attempt = do
+  result <- attempt
+  case result of
+    Left (FailureStatusError status) -> status.errorId === expected
+    Left err -> abort ("expected " <> expected <> ", got " <> show err)
+    Right _ -> abort ("expected " <> expected <> ", but it succeeded")
+
+failsVault : Text -> Script (Either SubmitError a) -> Script ()
+failsVault name = failsWith ("canton-solutions/vault-" <> name)
+
+failsMissing : Script (Either SubmitError a) -> Script ()
+failsMissing attempt = do
+  result <- attempt
+  case result of
+    Left ContractNotFound {} -> pure ()
+    Left err -> abort ("expected a missing contract, got " <> show err)
+    Right _ -> abort "a spent contract was accepted"
+
+failsAuth : Script (Either SubmitError a) -> Script ()
+failsAuth attempt = do
+  result <- attempt
+  case result of
+    Left (AuthorizationError _) -> pure ()
+    Left err -> abort ("expected an authorization failure, got " <> show err)
+    Right _ -> abort "expected an authorization failure"

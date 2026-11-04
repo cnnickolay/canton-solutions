@@ -1,0 +1,55 @@
+-- | Roles and the halt flag. The custodian gives a party a role for one vault,
+-- and can take it back. A role names one permission, such as "batch".
+module CantonSolutions.Vault.Roles where
+
+import DA.Action (unless, when)
+import DA.Fail (failWithStatus)
+
+import Splice.Api.Token.MetadataV1 (AnyContractId)
+
+import CantonSolutions.Vault.Errors
+
+eRoleWrongCustodian = invalid "role-wrong-custodian"
+eRoleWrongGrantee = invalid "role-wrong-grantee"
+eRoleWrongScope = invalid "role-wrong-scope"
+eHalted = stale "halted"
+eNotHalted = stale "not-halted"
+
+-- | One permission on one vault, given by the custodian to `grantee`.
+template VaultRole with
+    custodian : Party
+    grantee : Party
+    vault : AnyContractId
+      -- ^ The manager contract this role is for.
+    permission : Text
+  where
+    signatory custodian
+    observer grantee
+
+    choice VaultRole_Revoke : ()
+      controller custodian
+      do pure ()
+
+    choice VaultRole_Renounce : ()
+      controller grantee
+      do pure ()
+
+-- | Who is acting, and the role that lets them.
+data Authorization = Authorization with
+    actor : Party
+    role : ContractId VaultRole
+  deriving (Eq, Show)
+
+-- | The role must come from `custodian`, belong to the actor, and name this vault and permission.
+requireRole : Party -> AnyContractId -> Text -> Authorization -> Update ()
+requireRole custodian vault permission authorization = do
+  r <- fetch authorization.role
+  unless (r.custodian == custodian) (failWithStatus eRoleWrongCustodian)
+  unless (r.grantee == authorization.actor) (failWithStatus eRoleWrongGrantee)
+  unless (r.vault == vault && r.permission == permission) (failWithStatus eRoleWrongScope)
+
+requireRunning : Bool -> Update ()
+requireRunning halted = when halted (failWithStatus eHalted)
+
+requireHalted : Bool -> Update ()
+requireHalted halted = unless halted (failWithStatus eNotHalted)

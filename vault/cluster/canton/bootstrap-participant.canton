@@ -1,0 +1,12 @@
+// Start the participant and connect it to the synchronizer at SYNC_HOST,
+// retrying until the synchronizer is up.
+nodes.local.start()
+val p = participants.local.head
+val url = "http://" + sys.env.getOrElse("SYNC_HOST", "127.0.0.1") + ":5001"
+def connectOnce(): Boolean =
+  try { p.synchronizers.connect("vault", url); true }
+  catch { case e: Throwable => println("waiting for the synchronizer: " + e.getMessage.take(200)); false }
+var connected = connectOnce()
+while (!connected) { Thread.sleep(3000); connected = connectOnce() }
+utils.retry_until_true { p.synchronizers.active("vault") }
+println("PARTICIPANT READY")

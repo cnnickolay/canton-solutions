@@ -1,0 +1,328 @@
+-- | A small CIP-0112 token registry: holdings, committed allocations, batch
+-- settlement with mint and burn accounts, and one-step transfers. The vault
+-- uses it for its shares, and the tests use a second instance as the underlying.
+module CantonSolutions.Token
+  ( TokenRules (..)
+  , TokenHolding (..)
+  , TokenAllocation (..)
+  , TokenOffer (..)
+  , TokenOffer_Accept (..)
+  ) where
+
+import DA.Action (unless, when)
+import DA.Fail (failWithStatus, FailureCategory (..), FailureStatus (..))
+import DA.Foldable (forA_)
+import DA.List (unique)
+import DA.Map qualified as Map
+import DA.Optional (fromOptional, isNone, optionalToList)
+import DA.Set qualified as Set
+import DA.TextMap qualified as TextMap
+import DA.Time (RelTime, addRelTime)
+
+import Splice.Api.Token.AllocationInstructionV2 qualified as AI
+import Splice.Api.Token.AllocationV2 qualified as A
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+import Splice.TokenStandard.Utils (basicAccount, burnAccount, mintAccount, receiverSide, senderSide)
+
+-- Errors
+---------
+
+failure : Text -> FailureStatus
+failure name = FailureStatus with
+  errorId = "canton-solutions/token-" <> name
+  category = InvalidGivenCurrentSystemStateOther
+  message = "token: " <> name
+  meta = TextMap.empty
+
+eWrongAdmin = failure "wrong-admin"
+eWrongActors = failure "wrong-actors"
+eBadAccount = failure "bad-account"
+eBadLeg = failure "bad-leg"
+eBadHolding = failure "bad-holding"
+eNotEnoughFunds = failure "not-enough-funds"
+eTooLong = failure "lifetime-too-long"
+eExpired = failure "expired"
+eNotSupported = failure "not-supported"
+eWrongSettlement = failure "wrong-settlement"
+eLegsNotCovered = failure "legs-not-covered"
+eCommitted = failure "committed-until-deadline"
+
+-- Helpers
+----------
+
+-- | The parties that act for an account: its owner, or the admin for the mint and burn accounts.
+accountParties : Party -> H.Account -> [Party]
+accountParties admin account = optional [admin] (:: []) account.owner
+
+isSpecial : H.Account -> Bool
+isSpecial account = isNone account.owner
+
+requireActors : [Party] -> [Party] -> Update ()
+requireActors needed actors = forA_ needed $ \p -> unless (p `elem` actors) (failWithStatus eWrongActors)
+
+-- | Credits minus debits per instrument, from the authorizer's side of each leg.
+netAmounts : [A.TransferLegSide] -> TextMap.TextMap Decimal
+netAmounts sides = TextMap.fromListWithR (+)
+  [ (side.instrumentId, if side.side == A.ReceiverSide then side.amount else negate side.amount) | side <- sides ]
+
+-- | Archive owned, unlocked holdings of `admin` and return the amount per instrument.
+spendHoldings : Party -> Party -> [ContractId H.Holding] -> Update (TextMap.TextMap Decimal)
+spendHoldings admin owner cids = do
+  unless (unique cids) (failWithStatus eBadHolding)
+  amounts <- forA cids $ \cid -> do
+    let tokenCid = fromInterfaceContractId @TokenHolding cid
+    h <- fetch tokenCid
+    unless (h.admin == admin && h.owner == owner && isNone h.lock) (failWithStatus eBadHolding)
+    archive tokenCid
+    pure (h.instrument, h.amount)
+  pure (TextMap.fromListWithR (+) amounts)
+
+-- | Create one unlocked holding per instrument with a positive amount.
+payOut : Party -> Party -> TextMap.TextMap Decimal -> Update (TextMap.TextMap [ContractId H.Holding])
+payOut admin owner amounts = do
+  created <- forA [(i, a) | (i, a) <- TextMap.toList amounts, a > 0.0] $ \(instrument, amount) -> do
+    cid <- create TokenHolding with admin; owner; instrument; amount; lock = None
+    pure (instrument, [toInterfaceContractId @H.Holding cid])
+  pure (TextMap.fromList created)
+
+-- | Archive locked holdings and return their amounts per instrument.
+releaseLocked : [ContractId TokenHolding] -> Update (TextMap.TextMap Decimal)
+releaseLocked locked = do
+  amounts <- forA locked $ \cid -> do
+    h <- fetch cid
+    archive cid
+    pure (h.instrument, h.amount)
+  pure (TextMap.fromListWithR (+) amounts)
+
+-- | Give locked funds back to the account owner, unlocked.
+refundLocked : Party -> H.Account -> [ContractId TokenHolding] -> Update (TextMap.TextMap [ContractId H.Holding])
+refundLocked admin account locked = do
+  funds <- releaseLocked locked
+  case account.owner of
+    None -> pure TextMap.empty
+    Some owner -> payOut admin owner funds
+
+-- Templates
+------------
+
+-- | One unit of a token, owned by `owner`. Locked while it funds an allocation.
+template TokenHolding with
+    admin : Party
+    owner : Party
+    instrument : Text
+    amount : Decimal
+    lock : Optional H.Lock
+  where
+    signatory admin, owner
+    ensure amount > 0.0
+
+    interface instance H.Holding for TokenHolding where
+      view = H.HoldingView with
+        account = basicAccount owner
+        instrumentId = H.InstrumentId with admin; id = instrument
+        amount
+        lock
+        meta = emptyMetadata
+
+-- | A mint the admin offers to `owner`. The owner accepts from their own
+-- participant, which creates the holding with both signatures.
+template TokenOffer with
+    admin : Party
+    owner : Party
+    instrument : Text
+    amount : Decimal
+  where
+    signatory admin
+    observer owner
+    ensure amount > 0.0
+
+    choice TokenOffer_Accept : ContractId TokenHolding
+      controller owner
+      do create TokenHolding with admin; owner; instrument; amount; lock = None
+
+    choice TokenOffer_Withdraw : ()
+      controller admin
+      do pure ()
+
+-- | Funds set aside for one settlement. Settled by the factory, cancelled by
+-- the executors, or withdrawn by the owner (after the deadline if committed).
+template TokenAllocation with
+    admin : Party
+    settlement : A.SettlementInfo
+    spec : A.AllocationSpecification
+    locked : [ContractId TokenHolding]
+    createdAt : Time
+  where
+    signatory admin :: optionalToList spec.authorizer.owner
+    observer settlement.executors
+
+    interface instance A.Allocation for TokenAllocation where
+      view = A.AllocationView with
+        originalAllocationCid = None
+        settlement
+        allocation = spec
+        holdingCids = map toInterfaceContractId locked
+        createdAt
+        numIterations = 0
+        expiresAt = spec.settlementDeadline
+        availableActions = Map.fromList
+          [ (A.AA_Settle, [admin :: settlement.executors])
+          , (A.AA_Cancel, [settlement.executors])
+          , (A.AA_Withdraw, [accountParties admin spec.authorizer]) ]
+        meta = emptyMetadata
+
+      allocation_settleImpl _ arg = do
+        requireActors (admin :: settlement.executors) arg.actors
+        unless (null arg.extraTransferLegSides && isNone arg.nextIterationFunding) (failWithStatus eNotSupported)
+        now <- getTime
+        forA_ spec.settlementDeadline $ \deadline -> when (now > deadline) (failWithStatus eExpired)
+        funds <- releaseLocked locked
+        held <- case spec.authorizer.owner of
+          None -> pure TextMap.empty
+          Some owner -> do
+            let net = TextMap.fromListWithR (+) (TextMap.toList funds <> TextMap.toList (netAmounts spec.transferLegSides))
+            forA_ (map snd (TextMap.toList net)) $ \a -> when (a < 0.0) (failWithStatus eNotEnoughFunds)
+            payOut admin owner net
+        pure A.AllocationResult with
+          output = A.AllocationResult_Settled None
+          authorizerHoldingCids = held
+          meta = emptyMetadata
+
+      allocation_cancelImpl _ arg = do
+        unless (all (`elem` arg.actors) settlement.executors || admin `elem` arg.actors) (failWithStatus eWrongActors)
+        held <- refundLocked admin spec.authorizer locked
+        pure A.AllocationResult with
+          output = A.AllocationResult_Cancelled; authorizerHoldingCids = held; meta = emptyMetadata
+
+      allocation_withdrawImpl _ arg = do
+        requireActors (accountParties admin spec.authorizer) arg.actors
+        now <- getTime
+        when spec.committed $ forA_ spec.settlementDeadline $ \deadline ->
+          unless (now > deadline) (failWithStatus eCommitted)
+        held <- refundLocked admin spec.authorizer locked
+        pure A.AllocationResult with
+          output = A.AllocationResult_Withdrawn; authorizerHoldingCids = held; meta = emptyMetadata
+
+      allocation_settleExtraObservers _ = []
+      allocation_cancelExtraObservers _ = []
+      allocation_withdrawExtraObservers _ = []
+
+-- | The registry. Allocates, settles batches and transfers for one admin.
+template TokenRules with
+    admin : Party
+    maxLifetime : RelTime
+      -- ^ Longest allowed time from now to an allocation deadline or transfer expiry.
+  where
+    signatory admin
+
+    interface instance AI.AllocationFactory for TokenRules where
+      view = AI.AllocationFactoryView with admin; meta = emptyMetadata
+      allocationFactory_allocateExtraObservers _ = []
+      allocationFactory_publicFetchImpl _ _ = pure AI.AllocationFactoryView with admin; meta = emptyMetadata
+
+      allocationFactory_allocateImpl _ arg = do
+        let spec = arg.allocation
+            authorizer = spec.authorizer
+        unless (spec.admin == admin) (failWithStatus eWrongAdmin)
+        requireActors (accountParties admin authorizer) arg.actors
+        unless (isNone spec.nextIterationFunding) (failWithStatus eNotSupported)
+        unless (not (null spec.transferLegSides)) (failWithStatus eBadLeg)
+        forA_ spec.transferLegSides $ \side -> unless (side.amount > 0.0) (failWithStatus eBadLeg)
+        -- Mint accounts only send, burn accounts only receive.
+        when (authorizer == mintAccount) $
+          forA_ spec.transferLegSides $ \side -> unless (side.side == A.SenderSide) (failWithStatus eBadAccount)
+        when (authorizer == burnAccount) $
+          forA_ spec.transferLegSides $ \side -> unless (side.side == A.ReceiverSide) (failWithStatus eBadAccount)
+        unless (isSpecial authorizer == (authorizer == mintAccount || authorizer == burnAccount)
+                && (isSpecial authorizer || authorizer == basicAccount (fromOptional admin authorizer.owner)))
+          (failWithStatus eBadAccount)
+        now <- getTime
+        forA_ spec.settlementDeadline $ \deadline ->
+          unless (deadline > now && deadline <= now `addRelTime` maxLifetime) (failWithStatus eTooLong)
+        (locked, change) <- case authorizer.owner of
+          None -> do
+            unless (null arg.inputHoldingCids) (failWithStatus eBadHolding)
+            pure ([], TextMap.empty)
+          Some owner -> do
+            inputs <- spendHoldings admin owner arg.inputHoldingCids
+            -- Fund only the net outflow per instrument.
+            let needed = TextMap.fromList [(i, negate a) | (i, a) <- TextMap.toList (netAmounts spec.transferLegSides), a < 0.0]
+                lockFor instrument amount = create TokenHolding with
+                  admin; owner; instrument; amount
+                  lock = Some H.Lock with
+                    holders = [admin]; expiresAt = spec.settlementDeadline; expiresAfter = None
+                    context = Some ("allocation for " <> arg.settlement.id)
+            forA_ (TextMap.toList needed) $ \(i, a) ->
+              unless (fromOptional 0.0 (TextMap.lookup i inputs) >= a) (failWithStatus eNotEnoughFunds)
+            locked <- forA (TextMap.toList needed) (uncurry lockFor)
+            let left = TextMap.fromList
+                  [(i, a - fromOptional 0.0 (TextMap.lookup i needed)) | (i, a) <- TextMap.toList inputs]
+            change <- payOut admin owner left
+            pure (locked, change)
+        cid <- create TokenAllocation with
+          admin; settlement = arg.settlement; spec; locked; createdAt = now
+        pure AI.AllocationInstructionResult with
+          output = AI.AllocationInstructionResult_Completed (toInterfaceContractId cid)
+          authorizerChangeCids = change
+          meta = emptyMetadata
+
+    interface instance A.SettlementFactory for TokenRules where
+      view = A.SettlementFactoryView with admin; meta = emptyMetadata
+      settlementFactory_settleBatchExtraObservers _ = []
+      settlementFactory_publicFetchImpl _ _ = pure A.SettlementFactoryView with admin; meta = emptyMetadata
+
+      settlementFactory_settleBatchImpl _ arg = do
+        let executors = arg.settlement.executors
+        unless (not (null executors)) (failWithStatus eWrongActors)
+        requireActors executors arg.actors
+        unless (unique (map (.transferLegId) arg.transferLegs)) (failWithStatus eBadLeg)
+        forA_ arg.transferLegs $ \l -> unless (l.amount > 0.0) (failWithStatus eBadLeg)
+        views <- forA arg.allocations $ \finalized -> do
+          unless (null finalized.extraTransferLegSides && isNone finalized.nextIterationFunding)
+            (failWithStatus eNotSupported)
+          v <- view <$> fetch finalized.allocationCid
+          unless (v.settlement == arg.settlement) (failWithStatus eWrongSettlement)
+          unless (v.allocation.admin == admin) (failWithStatus eWrongAdmin)
+          pure v
+        -- Every side of every leg must be covered by exactly one allocation.
+        let required = Set.fromList $ concat
+              [ [(l.sender, senderSide l), (l.receiver, receiverSide l)] | l <- arg.transferLegs ]
+            offered = [ (v.allocation.authorizer, side) | v <- views, side <- v.allocation.transferLegSides ]
+        unless (unique offered && Set.fromList offered == required) (failWithStatus eLegsNotCovered)
+        results <- forA arg.allocations $ \finalized ->
+          exercise finalized.allocationCid A.Allocation_Settle with
+            actors = admin :: executors
+            extraTransferLegSides = []
+            nextIterationFunding = None
+            extraArgs = arg.extraArgs
+        pure A.SettlementFactory_SettleBatchResult with allocationSettleResults = results; meta = emptyMetadata
+
+    interface instance T.TransferFactory for TokenRules where
+      view = T.TransferFactoryView with admin; meta = emptyMetadata
+      transferFactory_transferExtraObservers _ = []
+      transferFactory_publicFetchImpl _ _ = pure T.TransferFactoryView with admin; meta = emptyMetadata
+
+      -- | One-step transfers only: the actors must cover sender and receiver.
+      -- A self-transfer splits or merges holdings.
+      transferFactory_transferImpl _ arg = do
+        let t = arg.transfer
+        unless (t.instrumentId.admin == admin) (failWithStatus eWrongAdmin)
+        unless (t.amount > 0.0) (failWithStatus eBadLeg)
+        sender <- optional (failWithStatus eBadAccount) pure t.sender.owner
+        receiver <- optional (failWithStatus eBadAccount) pure t.receiver.owner
+        unless (t.sender == basicAccount sender && t.receiver == basicAccount receiver) (failWithStatus eBadAccount)
+        requireActors [sender, receiver] arg.actors
+        now <- getTime
+        unless (now < t.executeBefore && t.executeBefore <= now `addRelTime` maxLifetime) (failWithStatus eExpired)
+        inputs <- spendHoldings admin sender t.inputHoldingCids
+        let have = fromOptional 0.0 (TextMap.lookup t.instrumentId.id inputs)
+        unless (have >= t.amount) (failWithStatus eNotEnoughFunds)
+        received <- create TokenHolding with
+          admin; owner = receiver; instrument = t.instrumentId.id; amount = t.amount; lock = None
+        change <- payOut admin sender (TextMap.insert t.instrumentId.id (have - t.amount) inputs)
+        pure T.TransferInstructionResult with
+          output = T.TransferInstructionResult_Completed [toInterfaceContractId received]
+          senderChangeCids = concatMap snd (TextMap.toList change)
+          meta = emptyMetadata

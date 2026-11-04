@@ -1,0 +1,685 @@
+-- | A batched vault. Holders place orders backed by CIP-0112 allocations, and a
+-- batcher executes many orders in one transaction that writes the ledger once.
+module CantonSolutions.Vault.Manager where
+
+import DA.Action (foldlA, unless, when)
+import DA.Fail (failWithStatus)
+import DA.List (sortOn, unique)
+import DA.Optional (isNone)
+import DA.Time (RelTime, addRelTime, seconds)
+
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocInstr
+import Splice.Api.Token.AllocationV2 qualified as A
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils (basicAccount, burnAccount, mintAccount, receiverSide, senderSide)
+
+import CantonSolutions.Token (TokenRules (..))
+
+import CantonSolutions.Vault.Errors
+import CantonSolutions.Vault.Math
+import CantonSolutions.Vault.Roles
+import CantonSolutions.Vault.Settlement
+
+-- Terms and book
+-----------------
+
+-- | Fixed terms of one vault.
+data VaultTerms = VaultTerms with
+    custodian : Party
+      -- ^ Holds the reserve, signs the manager and ledger, and administers the shares.
+    sponsor : Party
+      -- ^ The only party that may top up the reserve without getting shares.
+    underlying : H.InstrumentId
+      -- ^ The one asset the vault holds.
+    underlyingAllocator : ContractId AllocInstr.AllocationFactory
+      -- ^ Allocation factory of the underlying registry.
+    underlyingSettler : ContractId A.SettlementFactory
+      -- ^ Settlement factory of the underlying registry.
+    shareRegistry : ContractId TokenRules
+      -- ^ Share token registry, administered by the custodian.
+    shareId : Text
+      -- ^ Instrument id of the share token.
+    orderLifetime : RelTime
+      -- ^ Longest time an order may stay open.
+    underlyingLifetime : RelTime
+      -- ^ Longest allocation lifetime the underlying registry supports.
+  deriving (Eq, Show)
+
+-- | What the vault holds and owes. The price is `managedAssets / issuedShares`.
+data Book = Book with
+    managedAssets : Decimal
+      -- ^ Accounted assets. Always the sum of `reserve`.
+    issuedShares : Decimal
+      -- ^ Shares outstanding, including shares locked in redeem orders.
+    reserve : [ContractId H.Holding]
+      -- ^ The custodian's holdings that back the shares. Anything else the
+      -- custodian holds, for example an unsolicited transfer, is ignored.
+  deriving (Eq, Show)
+
+-- Order terms
+--------------
+
+-- | Assets in, at least `minShares` shares out.
+data DepositSpec = DepositSpec with
+    custodian : Party
+    holder : Party
+    manager : ContractId VaultManager
+    allocation : ContractId A.Allocation
+      -- ^ Committed allocation of `amount` underlying to the custodian.
+    amount : Decimal
+    minShares : Decimal
+    placedAt : Time
+      -- ^ Ledger time when the manager accepted the order.
+    deadline : Time
+  deriving (Eq, Show)
+
+-- | Shares in, at least `minAssets` assets out.
+data RedeemSpec = RedeemSpec with
+    custodian : Party
+    holder : Party
+    manager : ContractId VaultManager
+    allocation : ContractId A.Allocation
+      -- ^ Committed allocation of `amount` shares to the burn account.
+    amount : Decimal
+    minAssets : Decimal
+    placedAt : Time
+    deadline : Time
+  deriving (Eq, Show)
+
+-- | Assets in, nothing out. Raises the share price.
+data TopUpSpec = TopUpSpec with
+    custodian : Party
+    sponsor : Party
+    manager : ContractId VaultManager
+    allocation : ContractId A.Allocation
+    amount : Decimal
+    placedAt : Time
+    deadline : Time
+  deriving (Eq, Show)
+
+-- | A holder's order. A top-up is not a holder order.
+data HolderOrder = HolderDeposit DepositSpec | HolderRedeem RedeemSpec
+  deriving (Eq, Show)
+
+-- | The fields every order has, for checks and ordering.
+data OrderCommon = OrderCommon with
+    custodian : Party
+    manager : ContractId VaultManager
+    allocation : ContractId A.Allocation
+    amount : Decimal
+    placedAt : Time
+    deadline : Time
+    owner : Party
+      -- ^ The holder or the sponsor, whoever locked the input.
+  deriving (Eq, Show)
+
+-- Batches
+----------
+
+-- | One order picked for a batch.
+data OrderRef
+  = DepositRef (ContractId DepositOrder)
+  | RedeemRef (ContractId RedeemOrder)
+  | TopUpRef (ContractId TopUpOrder)
+  deriving (Eq, Ord, Show)
+
+-- | An executed order. `amountOut` is shares minted, assets paid, or zero for a top-up.
+data Execution = Execution with
+    order : OrderRef
+    amountOut : Decimal
+  deriving (Eq, Show)
+
+-- | Result of a batch. Executions are in execution order. Deferred orders stay
+-- open. When nothing executed, `ledger` is the input ledger.
+data BatchReport = BatchReport with
+    ledger : ContractId VaultLedger
+    executed : [Execution]
+    deferred : [OrderRef]
+  deriving (Eq, Show)
+
+-- Templates
+------------
+
+-- | The book of one vault. Replaced once per batch that executes something,
+-- and on halt or resume.
+template VaultLedger with
+    custodian : Party
+    manager : ContractId VaultManager
+    book : Book
+    halted : Bool
+    previous : Optional (ContractId VaultLedger)
+  where
+    signatory custodian
+    ensure book.managedAssets >= 0.0 && book.issuedShares >= 0.0
+
+    choice VaultLedger_Roll : ContractId VaultLedger
+      -- ^ Replace the book. Exercised by the manager inside a batch.
+      with next : Book
+      controller custodian
+      do create this with book = next; previous = Some self
+
+    choice VaultLedger_SetHalted : ContractId VaultLedger
+      -- ^ Replace the halt flag. Exercised by the manager on halt or resume.
+      with flag : Bool
+      controller custodian
+      do create this with halted = flag; previous = Some self
+
+-- | Entry point of the vault. Accepts orders and runs batches. Never replaced.
+template VaultManager with
+    terms : VaultTerms
+  where
+    signatory terms.custodian
+    observer terms.sponsor
+    ensure terms.orderLifetime > seconds 0
+      && terms.orderLifetime <= terms.underlyingLifetime
+      && terms.custodian /= terms.sponsor
+      && terms.shareId /= ""
+      && terms.underlying /= shareInstrument terms
+
+    nonconsuming choice VaultManager_Open : ContractId VaultLedger
+      -- ^ Create the empty ledger. The share registry must belong to the custodian
+      -- and allow allocations at least as long as an order.
+      controller terms.custodian
+      do
+        registry <- fetch terms.shareRegistry
+        unless (registry.admin == terms.custodian) (failWithStatus eShareRegistryNotCustodian)
+        unless (registry.maxLifetime >= terms.orderLifetime) (failWithStatus eShareLifetimeTooShort)
+        create VaultLedger with
+          custodian = terms.custodian
+          manager = self
+          book = Book with managedAssets = 0.0; issuedShares = 0.0; reserve = []
+          halted = False
+          previous = None
+
+    nonconsuming choice VaultManager_PlaceDeposit : ContractId DepositOrder
+      -- ^ Turn a committed allocation of the underlying into a deposit order.
+      with
+        holder : Party
+        allocation : ContractId A.Allocation
+        amount : Decimal
+        minShares : Decimal
+        deadline : Time
+      controller holder
+      do
+        placedAt <- getTime
+        let spec = DepositSpec with custodian = terms.custodian; manager = self; ..
+        _ <- checkDeposit terms spec
+        create DepositOrder with spec
+
+    nonconsuming choice VaultManager_PlaceRedeem : ContractId RedeemOrder
+      -- ^ Turn a committed allocation of shares into a redeem order.
+      with
+        holder : Party
+        allocation : ContractId A.Allocation
+        amount : Decimal
+        minAssets : Decimal
+        deadline : Time
+      controller holder
+      do
+        placedAt <- getTime
+        let spec = RedeemSpec with custodian = terms.custodian; manager = self; ..
+        _ <- checkRedeem terms spec
+        create RedeemOrder with spec
+
+    nonconsuming choice VaultManager_PlaceTopUp : ContractId TopUpOrder
+      -- ^ Turn the sponsor's committed allocation of the underlying into a top-up.
+      with
+        allocation : ContractId A.Allocation
+        amount : Decimal
+        deadline : Time
+      controller terms.sponsor
+      do
+        placedAt <- getTime
+        let spec = TopUpSpec with
+              custodian = terms.custodian; sponsor = terms.sponsor; manager = self; ..
+        _ <- checkTopUp terms spec
+        create TopUpOrder with spec
+
+    nonconsuming choice VaultManager_Halt : ContractId VaultLedger
+      -- ^ Stop batches. Orders can still be placed and withdrawn.
+      -- Needs a "halt" role from the custodian.
+      with
+        ledger : ContractId VaultLedger
+        authorization : Authorization
+      controller authorization.actor
+      do
+        requireRole terms.custodian (coerceContractId self) "halt" authorization
+        current <- fetchLedger terms self ledger
+        requireRunning current.halted
+        exercise ledger VaultLedger_SetHalted with flag = True
+
+    nonconsuming choice VaultManager_Resume : ContractId VaultLedger
+      -- ^ Allow batches again. Needs a "resume" role from the custodian.
+      with
+        ledger : ContractId VaultLedger
+        authorization : Authorization
+      controller authorization.actor
+      do
+        requireRole terms.custodian (coerceContractId self) "resume" authorization
+        current <- fetchLedger terms self ledger
+        requireHalted current.halted
+        exercise ledger VaultLedger_SetHalted with flag = False
+
+    nonconsuming choice VaultManager_RunBatch : BatchReport
+      -- ^ Execute the given orders against running totals, oldest first and
+      -- top-ups last. Orders that are expired, would get nothing or would miss
+      -- their minimum are deferred, not failed. Needs a "batch" role from the
+      -- custodian, and the batcher must not be the custodian.
+      with
+        ledger : ContractId VaultLedger
+        orders : [OrderRef]
+        underlyingArgs : ExtraArgs
+        authorization : Authorization
+      controller authorization.actor
+      do
+        requireRole terms.custodian (coerceContractId self) "batch" authorization
+        unless (authorization.actor /= terms.custodian) (failWithStatus eBatcherIsCustodian)
+        when (null orders) (failWithStatus eEmptyBatch)
+        unless (unique orders) (failWithStatus eDuplicateOrder)
+        current <- fetchLedger terms self ledger
+        requireRunning current.halted
+        opening <- sumHoldings terms.underlying terms.custodian current.book.reserve
+        unless (opening == current.book.managedAssets) (failWithStatus eReserveMismatch)
+        picked <- forA orders $ \ref -> do
+          common <- fetchCommon ref
+          unless (common.manager == self && common.custodian == terms.custodian)
+            (failWithStatus eOrderWrongManager)
+          pure (ref, common)
+        let queue = sortOn (\(ref, common) -> (isTopUp ref, common.placedAt, ref)) picked
+        (closing, executed, deferred) <-
+          foldlA (step underlyingArgs) (current.book, [], []) queue
+        held <- sumHoldings terms.underlying terms.custodian closing.reserve
+        unless (held == closing.managedAssets) (failWithStatus eClosingReserveMismatch)
+        next <- if null executed then pure ledger else exercise ledger VaultLedger_Roll with next = closing
+        pure BatchReport with ledger = next; executed; deferred
+
+-- | A deposit order. Signed by the custodian and the holder, so executing it
+-- can create the holder's share receipt with the holder's authority.
+template DepositOrder with
+    spec : DepositSpec
+  where
+    signatory spec.custodian, spec.holder
+
+    choice DepositOrder_Execute : (Book, Decimal)
+      -- ^ Settle the deposit against `book` and return the new book and shares minted.
+      with
+        book : Book
+        underlyingArgs : ExtraArgs
+      controller spec.custodian
+      do
+        terms <- termsOf spec.manager
+        requireOpen spec.deadline
+        allocationView <- checkDeposit terms spec
+        executeDeposit terms spec allocationView book underlyingArgs
+
+    choice DepositOrder_Withdraw : A.AllocationResult
+      -- ^ After the deadline, withdraw the allocation and close the order.
+      with extraArgs : ExtraArgs
+      controller spec.holder
+      do withdraw (depositCommon spec) extraArgs
+
+    choice DepositOrder_Abandon : ()
+      -- ^ After the deadline, close an order whose allocation is already gone.
+      controller spec.holder
+      do requirePast spec.deadline
+
+-- | A redeem order.
+template RedeemOrder with
+    spec : RedeemSpec
+  where
+    signatory spec.custodian, spec.holder
+
+    choice RedeemOrder_Execute : (Book, Decimal)
+      -- ^ Settle the redemption against `book` and return the new book and assets paid.
+      with
+        book : Book
+        underlyingArgs : ExtraArgs
+      controller spec.custodian
+      do
+        terms <- termsOf spec.manager
+        requireOpen spec.deadline
+        allocationView <- checkRedeem terms spec
+        executeRedeem terms spec allocationView book underlyingArgs
+
+    choice RedeemOrder_Withdraw : A.AllocationResult
+      with extraArgs : ExtraArgs
+      controller spec.holder
+      do withdraw (redeemCommon spec) extraArgs
+
+    choice RedeemOrder_Abandon : ()
+      controller spec.holder
+      do requirePast spec.deadline
+
+-- | A sponsor top-up.
+template TopUpOrder with
+    spec : TopUpSpec
+  where
+    signatory spec.custodian, spec.sponsor
+
+    choice TopUpOrder_Execute : (Book, Decimal)
+      -- ^ Move the top-up into the reserve. Returns the new book and zero.
+      with
+        book : Book
+        underlyingArgs : ExtraArgs
+      controller spec.custodian
+      do
+        terms <- termsOf spec.manager
+        requireOpen spec.deadline
+        allocationView <- checkTopUp terms spec
+        executeTopUp terms spec allocationView book underlyingArgs
+
+    choice TopUpOrder_Withdraw : A.AllocationResult
+      with extraArgs : ExtraArgs
+      controller spec.sponsor
+      do withdraw (topUpCommon spec) extraArgs
+
+    choice TopUpOrder_Abandon : ()
+      controller spec.sponsor
+      do requirePast spec.deadline
+
+-- Lookups
+----------
+
+shareInstrument : VaultTerms -> H.InstrumentId
+shareInstrument terms = H.InstrumentId with admin = terms.custodian; id = terms.shareId
+
+termsOf : ContractId VaultManager -> Update VaultTerms
+termsOf cid = (.terms) <$> fetch cid
+
+fetchLedger : VaultTerms -> ContractId VaultManager -> ContractId VaultLedger -> Update VaultLedger
+fetchLedger terms self cid = do
+  current <- fetch cid
+  unless (current.manager == self && current.custodian == terms.custodian)
+    (failWithStatus eLedgerMismatch)
+  pure current
+
+depositCommon : DepositSpec -> OrderCommon
+depositCommon s = OrderCommon with
+  custodian = s.custodian; manager = s.manager; allocation = s.allocation
+  amount = s.amount; placedAt = s.placedAt; deadline = s.deadline; owner = s.holder
+
+redeemCommon : RedeemSpec -> OrderCommon
+redeemCommon s = OrderCommon with
+  custodian = s.custodian; manager = s.manager; allocation = s.allocation
+  amount = s.amount; placedAt = s.placedAt; deadline = s.deadline; owner = s.holder
+
+topUpCommon : TopUpSpec -> OrderCommon
+topUpCommon s = OrderCommon with
+  custodian = s.custodian; manager = s.manager; allocation = s.allocation
+  amount = s.amount; placedAt = s.placedAt; deadline = s.deadline; owner = s.sponsor
+
+fetchCommon : OrderRef -> Update OrderCommon
+fetchCommon (DepositRef cid) = depositCommon . (.spec) <$> fetch cid
+fetchCommon (RedeemRef cid) = redeemCommon . (.spec) <$> fetch cid
+fetchCommon (TopUpRef cid) = topUpCommon . (.spec) <$> fetch cid
+
+isTopUp : OrderRef -> Bool
+isTopUp (TopUpRef _) = True
+isTopUp _ = False
+
+-- Deadlines
+------------
+
+-- | Orders execute strictly before their deadline.
+requireOpen : Time -> Update ()
+requireOpen deadline = do
+  now <- getTime
+  unless (now < deadline) (failWithStatus (eOrderExpired deadline now))
+
+-- | Orders are abandoned strictly after their deadline.
+requirePast : Time -> Update ()
+requirePast deadline = do
+  now <- getTime
+  unless (now > deadline) (failWithStatus (eAbandonBeforeDeadline deadline now))
+
+-- | Withdraw the order's allocation strictly after the deadline, then close it.
+withdraw : OrderCommon -> ExtraArgs -> Update A.AllocationResult
+withdraw common extraArgs = do
+  now <- getTime
+  unless (now > common.deadline) (failWithStatus (eWithdrawBeforeDeadline common.deadline now))
+  result <- exercise common.allocation A.Allocation_Withdraw with
+    actors = [common.owner]
+    extraArgs
+  unless (result.output == A.AllocationResult_Withdrawn) (failWithStatus eWithdrawIncomplete)
+  pure result
+
+-- Order checks
+---------------
+
+-- | Checks shared by all orders. `checkMinimum` runs between the amount and time checks.
+checkCommon : VaultTerms -> OrderCommon -> Update () -> Update ()
+checkCommon terms common checkMinimum = do
+  now <- getTime
+  unless (common.custodian == terms.custodian) (failWithStatus eOrderWrongCustodian)
+  unless (common.owner /= terms.custodian) (failWithStatus eHolderIsCustodian)
+  unless (common.amount > 0.0) (failWithStatus eBadAmount)
+  checkMinimum
+  unless (common.placedAt <= now && common.placedAt < common.deadline)
+    (failWithStatus eBadOrderTime)
+  unless (common.deadline <= common.placedAt `addRelTime` terms.orderLifetime)
+    (failWithStatus eOrderLifetimeExceeded)
+  unless (now < common.deadline) (failWithStatus (eOrderExpired common.deadline now))
+
+checkDeposit : VaultTerms -> DepositSpec -> Update A.AllocationView
+checkDeposit terms spec = do
+  let common = depositCommon spec
+  checkCommon terms common $ unless (spec.minShares >= 0.0) (failWithStatus eBadAmount)
+  checkAllocation terms common terms.underlying (basicAccount terms.custodian)
+
+checkRedeem : VaultTerms -> RedeemSpec -> Update A.AllocationView
+checkRedeem terms spec = do
+  let common = redeemCommon spec
+  checkCommon terms common $ unless (spec.minAssets >= 0.0) (failWithStatus eBadAmount)
+  checkAllocation terms common (shareInstrument terms) burnAccount
+
+checkTopUp : VaultTerms -> TopUpSpec -> Update A.AllocationView
+checkTopUp terms spec = do
+  let common = topUpCommon spec
+  checkCommon terms common (pure ())
+  unless (spec.sponsor == terms.sponsor) (failWithStatus eWrongSponsor)
+  checkAllocation terms common terms.underlying (basicAccount terms.custodian)
+
+-- | The allocation must lock exactly the order's input, in one sender leg to
+-- `receiver`, committed and non-iterated, with the custodian as sole executor,
+-- and must stay valid for the whole life of the order.
+checkAllocation
+  : VaultTerms -> OrderCommon -> H.InstrumentId -> H.Account -> Update A.AllocationView
+checkAllocation terms common instrument receiver = do
+  allocation <- fetch common.allocation
+  let v = view allocation
+      spec = v.allocation
+  unless (spec.admin == instrument.admin && instrument.admin `elem` signatory allocation)
+    (failWithStatus (eAllocationAdminMismatch instrument.admin spec.admin))
+  unless (spec.authorizer == basicAccount common.owner) (failWithStatus eAllocationWrongAuthorizer)
+  unless (v.settlement.executors == [terms.custodian]) (failWithStatus eAllocationWrongExecutor)
+  unless (isNone spec.nextIterationFunding && v.numIterations == 0 && isNone v.originalAllocationCid)
+    (failWithStatus eAllocationIterated)
+  unless spec.committed (failWithStatus eAllocationNotCommitted)
+  unless (spec.settlementDeadline == Some common.deadline) (failWithStatus eAllocationDeadlineMismatch)
+  unless (common.deadline <= v.createdAt `addRelTime` terms.underlyingLifetime)
+    (failWithStatus eAllocationLifetimeExceeded)
+  unless (optional True (>= common.deadline) v.expiresAt) (failWithStatus eAllocationExpiresEarly)
+  case spec.transferLegSides of
+    [leg] -> do
+      unless (leg.side == A.SenderSide) (failWithStatus eLegWrongSide)
+      unless (leg.instrumentId == instrument.id) (failWithStatus eLegWrongInstrument)
+      unless (leg.otherside == receiver) (failWithStatus eLegWrongReceiver)
+      unless (leg.amount == common.amount) (failWithStatus eLegWrongAmount)
+    _ -> failWithStatus eLegCount
+  pure v
+
+-- Batch step
+-------------
+
+hasPrice : Book -> Bool
+hasPrice book = book.managedAssets > 0.0 && book.issuedShares > 0.0
+
+isEmptyBook : Book -> Bool
+isEmptyBook book = book.managedAssets == 0.0 && book.issuedShares == 0.0
+
+-- | What a holder order would get at `book`. `None` when the book cannot price it.
+quote : HolderOrder -> Book -> Optional Decimal
+quote (HolderDeposit d) book
+  | d.amount > 0.0 && (hasPrice book || isEmptyBook book) =
+      quoteDeposit d.amount book.managedAssets book.issuedShares
+quote (HolderRedeem r) book
+  | r.amount > 0.0 && hasPrice book = quoteRedeem r.amount book.managedAssets book.issuedShares
+quote _ _ = None
+
+minimumOut : HolderOrder -> Decimal
+minimumOut (HolderDeposit d) = d.minShares
+minimumOut (HolderRedeem r) = r.minAssets
+
+-- | Execute one order or defer it, carrying the running book forward.
+step
+  : ExtraArgs
+  -> (Book, [Execution], [OrderRef])
+  -> (OrderRef, OrderCommon)
+  -> Update (Book, [Execution], [OrderRef])
+step underlyingArgs (book, executed, deferred) (ref, common) = do
+  now <- getTime
+  let defer = pure (book, executed, deferred <> [ref])
+      run action = do
+        (next, amountOut) <- action
+        pure (next, executed <> [Execution with order = ref; amountOut], deferred)
+      runHolder order action = case quote order book of
+        Some out | out > 0.0 && out >= minimumOut order -> run action
+        _ -> defer
+  if now >= common.deadline then defer else case ref of
+    DepositRef cid -> do
+      order <- fetch cid
+      runHolder (HolderDeposit order.spec) (exercise cid DepositOrder_Execute with book; underlyingArgs)
+    RedeemRef cid -> do
+      order <- fetch cid
+      runHolder (HolderRedeem order.spec) (exercise cid RedeemOrder_Execute with book; underlyingArgs)
+    TopUpRef cid
+      | book.issuedShares <= 0.0 -> defer
+      | otherwise -> run (exercise cid TopUpOrder_Execute with book; underlyingArgs)
+
+-- Execution
+------------
+
+-- | Rebuild the full leg from the single sender side of an input allocation.
+inputLeg : OrderCommon -> A.AllocationView -> Update A.TransferLeg
+inputLeg common v = case v.allocation.transferLegSides of
+  [side] -> pure A.TransferLeg with
+    transferLegId = side.transferLegId
+    sender = basicAccount common.owner
+    receiver = side.otherside
+    amount = side.amount
+    instrumentId = side.instrumentId
+    meta = side.meta
+  _ -> failWithStatus eLegCount
+
+leg : Text -> H.Account -> H.Account -> Decimal -> Text -> A.TransferLeg
+leg transferLegId sender receiver amount instrumentId = A.TransferLeg with
+  transferLegId; sender; receiver; amount; instrumentId; meta = emptyMetadata
+
+receiptOf : [A.AllocationResult] -> Update A.AllocationResult
+receiptOf [_, receipt] = pure receipt
+receiptOf _ = failWithStatus eSettlementResultsIncomplete
+
+-- | Pull the order's underlying input into the custodian's account and return
+-- the holdings received.
+collectUnderlying
+  : VaultTerms -> OrderCommon -> A.AllocationView -> ExtraArgs -> Update [ContractId H.Holding]
+collectUnderlying terms common v underlyingArgs = do
+  input <- inputLeg common v
+  (receiver, change) <- commit terms.underlyingAllocator terms.underlying.admin v.settlement
+    (basicAccount terms.custodian) [receiverSide input] [] common.deadline [terms.custodian]
+    underlyingArgs
+  unless (null change) (failWithStatus eUnexpectedChange)
+  results <- settleLegs terms.underlyingSettler terms.underlying.admin terms.custodian v.settlement
+    [input] [common.allocation, receiver] underlyingArgs
+  receipt <- receiptOf results
+  let holdings = heldUnder terms.underlying.id receipt.authorizerHoldingCids
+  received <- sumHoldings terms.underlying terms.custodian holdings
+  unless (received == common.amount) (failWithStatus eWrongAssetReceipt)
+  pure holdings
+
+executeDeposit
+  : VaultTerms -> DepositSpec -> A.AllocationView -> Book -> ExtraArgs -> Update (Book, Decimal)
+executeDeposit terms spec v book underlyingArgs = do
+  unless (spec.amount > 0.0 && (hasPrice book || isEmptyBook book)) (failWithStatus eBadPriceInput)
+  shares <- case quoteDeposit spec.amount book.managedAssets book.issuedShares of
+    Some out -> pure out
+    None -> failWithStatus eBadPriceInput
+  unless (shares > 0.0) (failWithStatus eZeroOutput)
+  unless (shares >= spec.minShares) (failWithStatus (eBelowMinShares spec.minShares shares))
+  received <- collectUnderlying terms (depositCommon spec) v underlyingArgs
+  let mint = leg "share-mint" mintAccount (basicAccount spec.holder) shares terms.shareId
+      allocator = toInterfaceContractId @AllocInstr.AllocationFactory terms.shareRegistry
+      settler = toInterfaceContractId @A.SettlementFactory terms.shareRegistry
+  (fromMint, mintChange) <- commit allocator terms.custodian v.settlement mintAccount
+    [senderSide mint] [] spec.deadline [terms.custodian] noArgs
+  unless (null mintChange) (failWithStatus eUnexpectedChange)
+  (toHolder, holderChange) <- commit allocator terms.custodian v.settlement
+    (basicAccount spec.holder) [receiverSide mint] [] spec.deadline [spec.holder] noArgs
+  unless (null holderChange) (failWithStatus eUnexpectedChange)
+  results <- settleLegs settler terms.custodian terms.custodian v.settlement [mint]
+    [fromMint, toHolder] noArgs
+  receipt <- receiptOf results
+  minted <- sumHoldings (shareInstrument terms) spec.holder
+    (heldUnder terms.shareId receipt.authorizerHoldingCids)
+  unless (minted == shares) (failWithStatus eWrongShareMint)
+  let next = Book with
+        managedAssets = book.managedAssets + spec.amount
+        issuedShares = book.issuedShares + shares
+        reserve = book.reserve <> received
+  pure (next, shares)
+
+executeRedeem
+  : VaultTerms -> RedeemSpec -> A.AllocationView -> Book -> ExtraArgs -> Update (Book, Decimal)
+executeRedeem terms spec v book underlyingArgs = do
+  unless (spec.amount > 0.0 && hasPrice book) (failWithStatus eBadPriceInput)
+  assets <- case quoteRedeem spec.amount book.managedAssets book.issuedShares of
+    Some out -> pure out
+    None -> failWithStatus eBadPriceInput
+  let managedAfter = book.managedAssets - assets
+      issuedAfter = book.issuedShares - spec.amount
+  unless (assets > 0.0) (failWithStatus eZeroOutput)
+  unless (assets >= spec.minAssets) (failWithStatus (eBelowMinAssets spec.minAssets assets))
+  -- Either both totals stay positive, or the last holder leaves and both reach zero.
+  unless (managedAfter >= 0.0 && issuedAfter >= 0.0 && (managedAfter == 0.0) == (issuedAfter == 0.0))
+    (failWithStatus ePartialLastExit)
+  burn <- inputLeg (redeemCommon spec) v
+  let allocator = toInterfaceContractId @AllocInstr.AllocationFactory terms.shareRegistry
+      settler = toInterfaceContractId @A.SettlementFactory terms.shareRegistry
+  (toBurn, burnChange) <- commit allocator terms.custodian v.settlement burnAccount
+    [receiverSide burn] [] spec.deadline [terms.custodian] noArgs
+  unless (null burnChange) (failWithStatus eUnexpectedChange)
+  _ <- settleLegs settler terms.custodian terms.custodian v.settlement [burn]
+    [spec.allocation, toBurn] noArgs
+  let payout = leg "payout" (basicAccount terms.custodian) (basicAccount spec.holder) assets
+        terms.underlying.id
+  (fromReserve, reserveChange) <- commit terms.underlyingAllocator terms.underlying.admin
+    v.settlement (basicAccount terms.custodian) [senderSide payout] book.reserve spec.deadline
+    [terms.custodian] underlyingArgs
+  (toHolder, holderChange) <- commit terms.underlyingAllocator terms.underlying.admin
+    v.settlement (basicAccount spec.holder) [receiverSide payout] [] spec.deadline [spec.holder]
+    underlyingArgs
+  unless (null holderChange) (failWithStatus eUnexpectedChange)
+  results <- settleLegs terms.underlyingSettler terms.underlying.admin terms.custodian v.settlement
+    [payout] [fromReserve, toHolder] underlyingArgs
+  (sent, receipt) <- case results of
+    [sent, receipt] -> pure (sent, receipt)
+    _ -> failWithStatus eSettlementResultsIncomplete
+  paid <- sumHoldings terms.underlying spec.holder
+    (heldUnder terms.underlying.id receipt.authorizerHoldingCids)
+  unless (paid == assets) (failWithStatus eWrongPayout)
+  let reserve = reserveChange <> heldUnder terms.underlying.id sent.authorizerHoldingCids
+  left <- sumHoldings terms.underlying terms.custodian reserve
+  unless (left == managedAfter) (failWithStatus eWrongReserveChange)
+  let next = Book with managedAssets = managedAfter; issuedShares = issuedAfter; reserve
+  pure (next, assets)
+
+executeTopUp
+  : VaultTerms -> TopUpSpec -> A.AllocationView -> Book -> ExtraArgs -> Update (Book, Decimal)
+executeTopUp terms spec v book underlyingArgs = do
+  unless (book.issuedShares > 0.0) (failWithStatus eTopUpWithoutShares)
+  received <- collectUnderlying terms (topUpCommon spec) v underlyingArgs
+  let next = book with
+        managedAssets = book.managedAssets + spec.amount
+        reserve = book.reserve <> received
+  pure (next, 0.0)

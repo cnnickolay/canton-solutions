@@ -1,0 +1,65 @@
+-- | Rounding and rejection rules of the price arithmetic.
+module CantonSolutions.Vault.Test.Math where
+
+import DA.Assert ((===))
+import DA.Fail (failWithStatus)
+import DA.Foldable (forA_)
+
+import Daml.Script
+
+import CantonSolutions.Vault.Errors
+import CantonSolutions.Vault.Math
+import CantonSolutions.Vault.Test.Setup (failsNative, failsVault)
+
+-- | Each conversion rounds the way ERC-4626 does, to one tick.
+testRoundingDirections : Script ()
+testRoundingDirections = script do
+  depositShares 1.0 3.0 2.0 === Some 0.6666666666
+  withdrawCost 1.0 3.0 2.0 === Some 0.6666666667
+  redeemAssets 1.0 2.0 3.0 === Some 0.6666666666
+  mintCost 1.0 2.0 3.0 === Some 0.6666666667
+  quoteRedeem tick 1.0 2.0 === Some 0.0
+  quoteDeposit tick 2.0 1.0 === Some 0.0
+  quoteDeposit 1.0 0.0 0.0 === Some 1.0
+
+-- | Lets a test run the arithmetic inside a ledger command.
+template Calc
+  with owner : Party
+  where
+    signatory owner
+    nonconsuming choice Calc_Run : Decimal
+      with rounding : Rounding; x : Decimal; y : Decimal; z : Decimal
+      controller owner
+      do
+        out <- case mulDiv rounding x y z of
+          None -> failWithStatus eBadPriceInput
+          Some out -> pure out
+        case positive out of
+          None -> failWithStatus eZeroOutput
+          Some out -> pure out
+
+-- | Bad inputs and zero results fail by name. Overflow stays a native error.
+testRejectedInputs : Script ()
+testRejectedInputs = script do
+  owner <- allocateParty "calc"
+  calc <- submit owner do createCmd Calc with owner
+  let run rounding x y z = trySubmit owner do exerciseCmd calc Calc_Run with rounding; x; y; z
+  failsVault "bad-price-input" $ run Floor 0.0 1.0 1.0
+  failsVault "bad-price-input" $ run Floor (-1.0) 1.0 1.0
+  failsVault "bad-price-input" $ run Floor 1.0 0.0 1.0
+  failsVault "bad-price-input" $ run Floor 1.0 1.0 0.0
+  failsVault "zero-output" $ run Floor tick 1.0 2.0
+  failsNative "ArithmeticError" $ run Floor 10000000000.0 10000000000.0 1.0
+  up <- submit owner do exerciseCmd calc Calc_Run with rounding = Ceil; x = tick; y = 1.0; z = 2.0
+  up === tick
+
+-- | Every combination of small tick counts matches plain integer floor and ceiling.
+testRoundingGrid : Script ()
+testRoundingGrid = script do
+  let ticks n = intToDecimal n * tick
+  forA_ [1 .. 12] $ \a -> forA_ [1 .. 12] $ \b -> forA_ [1 .. 12] $ \c -> do
+    let down : Int = (a * b) / c
+        up = if down * c < a * b then down + 1 else down
+    quoteRedeem (ticks a) (ticks b) (ticks c) === Some (ticks down)
+    mulDiv Floor (ticks a) (ticks b) (ticks c) === Some (ticks down)
+    mulDiv Ceil (ticks a) (ticks b) (ticks c) === Some (ticks up)

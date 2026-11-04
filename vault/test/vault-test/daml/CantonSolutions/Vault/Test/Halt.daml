@@ -1,0 +1,78 @@
+-- | Halting stops batches only. Orders can still be placed and withdrawn.
+module CantonSolutions.Vault.Test.Halt where
+
+import DA.Assert ((===))
+import DA.Time (addRelTime, minutes, seconds)
+
+import Daml.Script
+
+import CantonSolutions.Vault.Manager
+import CantonSolutions.Vault.Settlement (noArgs)
+import CantonSolutions.Vault.Test.Setup
+
+halt : World -> ContractId VaultLedger -> Script (ContractId VaultLedger)
+halt w ledger = submit (actAs w.warden <> readAs w.custodian) do
+  exerciseCmd w.manager VaultManager_Halt with ledger; authorization = w.haltRole
+
+resume : World -> ContractId VaultLedger -> Script (ContractId VaultLedger)
+resume w ledger = submit (actAs w.warden <> readAs w.custodian) do
+  exerciseCmd w.manager VaultManager_Resume with ledger; authorization = w.resumeRole
+
+-- | The vault's own halted error.
+failsHalted : Script (Either SubmitError a) -> Script ()
+failsHalted = failsVault "halted"
+
+-- | A halted vault refuses batches but still takes orders.
+testHaltStopsBatches : Script ()
+testHaltStopsBatches = script do
+  w <- world
+  d <- placeDeposit w w.alice 10.0 0.0 "seed"
+  seeded <- runBatch w w.ledger [DepositRef d]
+  halted <- halt w seeded.ledger
+  Some current <- queryContractId w.custodian halted
+  current.halted === True
+  current.previous === Some seeded.ledger
+  d2 <- placeDeposit w w.bob 5.0 0.0 "while-halted"
+  t <- placeTopUp w 1.0 "top-up-while-halted"
+  failsHalted $ trySubmit (asBatcher w) (batchCmd w halted [DepositRef d2])
+  failsHalted $ trySubmit (asBatcher w) (batchCmd w halted [TopUpRef t])
+  live <- resume w halted
+  report <- runBatch w live [DepositRef d2, TopUpRef t]
+  book <- checkBalances w report.ledger
+  book.managedAssets === 16.0
+  book.issuedShares === 15.0
+
+-- | Only the warden's roles halt and resume, and only on the right ledger.
+testHaltNeedsRole : Script ()
+testHaltNeedsRole = script do
+  w <- world
+  failsAuth $ trySubmit (actAs w.batcher <> readAs w.custodian) do
+    exerciseCmd w.manager VaultManager_Halt with ledger = w.ledger; authorization = w.haltRole
+  failsAuth $ trySubmit (actAs w.alice <> readAs w.custodian) do
+    exerciseCmd w.manager VaultManager_Halt with ledger = w.ledger; authorization = w.haltRole
+  failsAuth $ trySubmit (actAs w.warden <> readAs w.custodian) do
+    exerciseCmd w.ledger VaultLedger_SetHalted with flag = True
+  failsVault "not-halted" $ trySubmit (actAs w.warden <> readAs w.custodian) do
+    exerciseCmd w.manager VaultManager_Resume with ledger = w.ledger; authorization = w.resumeRole
+  halted <- halt w w.ledger
+  failsHalted $ trySubmit (actAs w.warden <> readAs w.custodian) do
+    exerciseCmd w.manager VaultManager_Halt with ledger = halted; authorization = w.haltRole
+  failsAuth $ trySubmit (actAs w.batcher <> readAs w.custodian) do
+    exerciseCmd w.manager VaultManager_Resume with ledger = halted; authorization = w.resumeRole
+  other <- submit w.custodian do createCmd VaultManager with terms = w.terms
+  otherRole <- giveRole w.custodian other w.warden "resume"
+  failsVault "ledger-mismatch" $ trySubmit (actAs w.warden <> readAs w.custodian) do
+    exerciseCmd other VaultManager_Resume with ledger = halted; authorization = otherRole
+  _ <- resume w halted
+  pure ()
+
+-- | A holder can still withdraw an expired order while the vault is halted.
+testWithdrawWhileHalted : Script ()
+testWithdrawWhileHalted = script do
+  w <- world
+  d <- placeDeposit w w.alice 10.0 0.0 "withdraw"
+  _ <- halt w w.ledger
+  setTime (t0 `addRelTime` (minutes 5 + seconds 1))
+  _ <- submit (actAs w.alice <> readAs w.custodian <> readAs w.registrar) do
+    exerciseCmd d DepositOrder_Withdraw with extraArgs = noArgs
+  pure ()

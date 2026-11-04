@@ -1,0 +1,9 @@
+sdk-version: 3.5.8
+
+packages:
+  - packages/token
+  - packages/vault-math
+  - packages/vault
+  - packages/vault-sharded
+  - test/vault-test
+  - test/vault-sharded-test

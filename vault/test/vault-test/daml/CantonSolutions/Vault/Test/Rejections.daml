@@ -1,0 +1,434 @@
+-- | Everything the vault refuses. A refused command changes nothing: orders,
+-- allocations and the ledger stay as they were.
+module CantonSolutions.Vault.Test.Rejections where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, hours, minutes, seconds)
+
+import Daml.Script
+
+import Splice.Api.Token.AllocationV2 qualified as A
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.TokenStandard.Utils (basicAccount)
+
+import CantonSolutions.Token
+
+import CantonSolutions.Vault.Manager
+import CantonSolutions.Vault.Settlement (noArgs)
+import CantonSolutions.Vault.Test.Setup
+
+-- | The batch must fail on a contract that is already gone.
+batchMissing : World -> ContractId VaultLedger -> [OrderRef] -> Script ()
+batchMissing w ledger orders = failsMissing $ trySubmit (asBatcher w) (batchCmd w ledger orders)
+
+-- | The batch must fail with this vault error.
+batchFails : Text -> World -> ContractId VaultLedger -> [OrderRef] -> Script ()
+batchFails name w ledger orders = failsVault name $ trySubmit (asBatcher w) (batchCmd w ledger orders)
+
+emptyBook : Book
+emptyBook = Book 0.0 0.0 []
+
+-- | Execute an order directly as the custodian, outside a batch.
+executeDeposit' : World -> ContractId DepositOrder -> Book -> Script (Either SubmitError (Book, Decimal))
+executeDeposit' w order book = trySubmit (actAs w.custodian <> readAs w.alice <> readAs w.registrar) do
+  exerciseCmd order DepositOrder_Execute with book; underlyingArgs = noArgs
+
+-- Authority and replay
+-----------------------
+
+-- | Only the right parties can act, and spent orders or old ledgers cannot be reused.
+testAuthorityAndReplay : Script ()
+testAuthorityAndReplay = script do
+  w <- world
+  d <- placeDeposit w w.alice 10.0 0.0 "authority"
+  failsAuth $ trySubmit (actAs w.bob <> readAs w.custodian <> readAs w.alice) (batchCmd w w.ledger [DepositRef d])
+  failsAuth $ trySubmit (actAs w.batcher <> readAs w.custodian <> readAs w.alice) do
+    exerciseCmd d DepositOrder_Execute with book = emptyBook; underlyingArgs = noArgs
+  failsAuth $ trySubmit (actAs w.batcher <> readAs w.custodian) do
+    exerciseCmd w.ledger VaultLedger_Roll with next = Book 100.0 100.0 []
+  Some original <- queryContractId w.alice d
+  failsAuth $ trySubmit w.alice do createCmd original with spec.placedAt = t0 `addRelTime` seconds (-1)
+  batchFails "empty-batch" w w.ledger []
+  batchFails "duplicate-order" w w.ledger [DepositRef d, DepositRef d]
+  first <- runBatch w w.ledger [DepositRef d]
+  batchMissing w first.ledger [DepositRef d]
+  d2 <- placeDeposit w w.bob 2.0 0.0 "old-ledger"
+  batchMissing w w.ledger [DepositRef d2]
+  second <- runBatch w first.ledger [DepositRef d2]
+  book <- checkBalances w second.ledger
+  book.managedAssets === 12.0
+  book.issuedShares === 12.0
+
+-- Minimums and deadlines
+-------------------------
+
+-- | Orders below their minimum or past their deadline are deferred, and the ledger stays put.
+testMinimumAndDeadline : Script ()
+testMinimumAndDeadline = script do
+  w <- world
+  d <- placeDeposit w w.alice 10.0 11.0 "minimum"
+  report <- runBatch w w.ledger [DepositRef d]
+  report.executed === []
+  report.deferred === [DepositRef d]
+  report.ledger === w.ledger
+  _ <- checkBalances w report.ledger
+  let withdrawEarly = failsVault "withdraw-before-deadline" $ trySubmit (actAs w.alice <> readAs w.custodian) do
+        exerciseCmd d DepositOrder_Withdraw with extraArgs = noArgs
+  withdrawEarly
+  setTime (t0 `addRelTime` minutes 5)
+  expired <- runBatch w report.ledger [DepositRef d]
+  expired.deferred === [DepositRef d]
+  failsVault "order-expired" $ trySubmit (actAs w.custodian <> readAs w.alice) do
+    exerciseCmd d DepositOrder_Execute with book = emptyBook; underlyingArgs = noArgs
+  withdrawEarly
+  setTime (t0 `addRelTime` seconds 301)
+  _ <- submit (actAs w.alice <> readAs w.custodian) do
+    exerciseCmd d DepositOrder_Withdraw with extraArgs = noArgs
+  batchMissing w expired.ledger [DepositRef d]
+  _ <- checkBalances w expired.ledger
+  pure ()
+
+-- | Expired redeem orders and top-ups give their inputs back.
+testWithdrawRedeemAndTopUp : Script ()
+testWithdrawRedeemAndTopUp = script do
+  w <- world
+  d <- placeDeposit w w.alice 10.0 0.0 "seed"
+  seeded <- runBatch w w.ledger [DepositRef d]
+  r <- placeRedeem w w.alice 2.0 0.0 "withdraw-redeem"
+  t <- placeTopUp w 3.0 "withdraw-top-up"
+  let withdrawRedeem = trySubmit (actAs w.alice <> readAs w.custodian) do
+        exerciseCmd r RedeemOrder_Withdraw with extraArgs = noArgs
+      withdrawTopUp = trySubmit (actAs w.sponsor <> readAs w.custodian) do
+        exerciseCmd t TopUpOrder_Withdraw with extraArgs = noArgs
+  failsVault "withdraw-before-deadline" withdrawRedeem
+  failsVault "withdraw-before-deadline" withdrawTopUp
+  setTime (t0 `addRelTime` seconds 301)
+  Right _ <- withdrawRedeem
+  Right _ <- withdrawTopUp
+  batchMissing w seeded.ledger [RedeemRef r]
+  batchMissing w seeded.ledger [TopUpRef t]
+  book <- checkBalances w seeded.ledger
+  book.managedAssets === 10.0
+  book.issuedShares === 10.0
+
+-- Order and allocation checks
+------------------------------
+
+-- | Bad amounts, times, owners and legs are refused when the order is placed.
+testBadOrders : Script ()
+testBadOrders = script do
+  w <- world
+  let deadline = t0 `addRelTime` minutes 5
+  a <- lockUnderlying w w.alice 10.0 deadline "good-input"
+  let place name amount minShares end = failsVault name $ trySubmit (actAs w.alice <> readAs w.custodian <> readAs w.registrar) do
+        exerciseCmd w.manager VaultManager_PlaceDeposit with
+          holder = w.alice; allocation = a; amount; minShares; deadline = end
+  place "leg-wrong-amount" 9.0 0.0 deadline
+  place "bad-amount" 0.0 0.0 deadline
+  place "bad-amount" (-1.0) 0.0 deadline
+  place "bad-amount" 10.0 (-1.0) deadline
+  place "allocation-deadline-mismatch" 10.0 0.0 (deadline `addRelTime` seconds 1)
+  failsVault "allocation-wrong-authorizer" $ trySubmit (actAs w.bob <> readAs w.custodian <> readAs w.alice <> readAs w.registrar) do
+    exerciseCmd w.manager VaultManager_PlaceDeposit with
+      holder = w.bob; allocation = a; amount = 10.0; minShares = 0.0; deadline
+  failsAuth $ trySubmit (actAs w.alice <> readAs w.custodian <> readAs w.sponsor) do
+    exerciseCmd w.manager VaultManager_PlaceTopUp with allocation = a; amount = 10.0; deadline
+  let placeOne name allocation end = failsVault name $ trySubmit (actAs w.alice <> readAs w.custodian <> readAs w.registrar) do
+        exerciseCmd w.manager VaultManager_PlaceDeposit with
+          holder = w.alice; allocation; amount = 1.0; minShares = 0.0; deadline = end
+  h1 <- mintUnderlying w w.alice 1.0
+  toBob <- lockInput w w.alice w.underlyingRules
+    (lockSpec w.registrar w.alice (basicAccount w.bob) "USD" 1.0 deadline) [h1] "to-bob"
+  placeOne "leg-wrong-receiver" toBob deadline
+  h2 <- mintUnderlying w w.alice 1.0
+  loose <- lockInput w w.alice w.underlyingRules
+    ((lockSpec w.registrar w.alice (basicAccount w.custodian) "USD" 1.0 deadline) with committed = False)
+    [h2] "not-committed"
+  placeOne "allocation-not-committed" loose deadline
+  let farDeadline = t0 `addRelTime` minutes 11
+  far <- lockUnderlying w w.alice 1.0 farDeadline "too-long"
+  placeOne "order-lifetime-exceeded" far farDeadline
+  setTime (t0 `addRelTime` minutes 5)
+  place "bad-order-time" 10.0 0.0 deadline
+
+-- | A top-up with no shares outstanding is deferred.
+testTopUpOfEmptyVault : Script ()
+testTopUpOfEmptyVault = script do
+  w <- world
+  t <- placeTopUp w 1.0 "empty"
+  report <- runBatch w w.ledger [TopUpRef t]
+  report.deferred === [TopUpRef t]
+  report.executed === []
+  report.ledger === w.ledger
+  book <- checkBalances w report.ledger
+  book.managedAssets === 0.0
+  book.issuedShares === 0.0
+
+-- | Only the vault's own underlying, through a committed allocation with the
+-- custodian as executor, can back a deposit.
+testWrongTokenOrAllocation : Script ()
+testWrongTokenOrAllocation = script do
+  w <- world
+  let deadline = t0 `addRelTime` minutes 5
+      place name allocation = failsVault name $ trySubmit (actAs w.alice <> readAs w.custodian <> readAs w.registrar <> readAs w.bob) do
+        exerciseCmd w.manager VaultManager_PlaceDeposit with
+          holder = w.alice; allocation; amount = 1.0; minShares = 0.0; deadline
+  eurHolding <- submit (actAs w.registrar <> actAs w.alice) do
+    createCmd TokenHolding with
+      admin = w.registrar; owner = w.alice; instrument = "EUR"; amount = 1.0; lock = None
+  eur <- lockInput w w.alice w.underlyingRules
+    (lockSpec w.registrar w.alice (basicAccount w.custodian) "EUR" 1.0 deadline)
+    [toInterfaceContractId @H.Holding eurHolding] "eur"
+  place "leg-wrong-instrument" eur
+  bobRules <- submit w.bob do createCmd TokenRules with admin = w.bob; maxLifetime = hours 1
+  bobHolding <- submit (actAs w.bob <> actAs w.alice) do
+    createCmd TokenHolding with
+      admin = w.bob; owner = w.alice; instrument = "USD"; amount = 1.0; lock = None
+  foreign <- lockInput (w with registrar = w.bob) w.alice bobRules
+    (lockSpec w.bob w.alice (basicAccount w.custodian) "USD" 1.0 deadline)
+    [toInterfaceContractId @H.Holding bobHolding] "other-registry"
+  place "allocation-admin-mismatch" foreign
+  -- The vault also refuses iterated allocations. This token cannot create one, so that check is not exercised here.
+  bobExecutes <- lockUnderlying (w with custodian = w.bob) w.alice 1.0 deadline "bob-executes"
+  place "allocation-wrong-executor" bobExecutes
+
+-- Atomicity and accounting
+---------------------------
+
+-- | One failing order rolls back the whole batch, including orders before it.
+testBatchIsAtomic : Script ()
+testBatchIsAtomic = script do
+  w <- world
+  good <- placeDeposit w w.alice 10.0 0.0 "good"
+  setTime (t0 `addRelTime` seconds 1)
+  bad <- placeDeposit w w.bob 2.0 0.0 "cancelled"
+  Some order <- queryContractId w.bob bad
+  _ <- submit (actAs w.custodian <> readAs w.bob <> readAs w.registrar) do
+    exerciseCmd order.spec.allocation A.Allocation_Cancel with actors = [w.custodian]; extraArgs = noArgs
+  batchMissing w w.ledger [DepositRef good, DepositRef bad]
+  book <- checkBalances w w.ledger
+  book.managedAssets === 0.0
+  book.issuedShares === 0.0
+  Some _ <- queryContractId w.alice good
+  report <- runBatch w w.ledger [DepositRef good]
+  book <- checkBalances w report.ledger
+  book.issuedShares === 10.0
+
+-- | Tokens sent straight to the custodian do not move the price, and an order
+-- that would mint zero shares is deferred.
+testDonationAndZeroMint : Script ()
+testDonationAndZeroMint = script do
+  w <- world
+  d <- placeDeposit w w.alice 1.0 0.0 "seed"
+  seeded <- runBatch w w.ledger [DepositRef d]
+  _ <- mintUnderlying w w.custodian 100.0
+  t <- placeTopUp w 1.0 "top-up"
+  topped <- runBatch w seeded.ledger [TopUpRef t]
+  book <- checkBalances w topped.ledger
+  book.managedAssets === 2.0
+  dust <- placeDeposit w w.bob 0.0000000001 0.0 "dust"
+  idle <- runBatch w topped.ledger [DepositRef dust]
+  idle.deferred === [DepositRef dust]
+  idle.executed === []
+  idle.ledger === topped.ledger
+  fair <- placeDeposit w w.alice 2.0 1.0 "fair"
+  report <- runBatch w idle.ledger [DepositRef dust, DepositRef fair]
+  report.deferred === [DepositRef dust]
+  report.executed === [Execution (DepositRef fair) 1.0]
+  _ <- checkBalances w report.ledger
+  pure ()
+
+-- Binding and custody
+----------------------
+
+-- | The ledger and the orders must belong to the manager, and the reserve must be real.
+testBinding : Script ()
+testBinding = script do
+  w <- world
+  d <- placeDeposit w w.alice 1.0 0.0 "binding"
+  other <- submit w.custodian do createCmd VaultManager with terms = w.terms
+  otherLedger <- submit w.custodian do exerciseCmd other VaultManager_Open
+  batchFails "ledger-mismatch" w otherLedger [DepositRef d]
+  otherRole <- giveRole w.custodian other w.batcher "batch"
+  failsVault "order-wrong-manager" $ trySubmit (actAs w.batcher <> readAs w.custodian <> readAs w.alice) do
+    exerciseCmd other VaultManager_RunBatch with
+      ledger = otherLedger; orders = [DepositRef d]; underlyingArgs = noArgs; authorization = otherRole
+  forged <- submit w.custodian do
+    createCmd VaultLedger with
+      custodian = w.custodian; manager = w.manager; book = Book 1.0 1.0 []; halted = False; previous = None
+  batchFails "reserve-mismatch" w forged [DepositRef d]
+  report <- runBatch w w.ledger [DepositRef d]
+  _ <- checkBalances w report.ledger
+  pure ()
+
+-- | Orders need both signatories to archive directly. The custodian alone can
+-- archive its own manager and ledger.
+testDirectArchive : Script ()
+testDirectArchive = script do
+  w <- world
+  d <- placeDeposit w w.alice 10.0 0.0 "seed"
+  seeded <- runBatch w w.ledger [DepositRef d]
+  r <- placeRedeem w w.alice 1.0 0.0 "archive-redeem"
+  d2 <- placeDeposit w w.bob 1.0 0.0 "archive-deposit"
+  t <- placeTopUp w 1.0 "archive-top-up"
+  failsAuth $ trySubmit (actAs w.alice <> readAs w.custodian) do archiveCmd r
+  failsAuth $ trySubmit (actAs w.bob <> readAs w.custodian) do archiveCmd d2
+  failsAuth $ trySubmit (actAs w.sponsor <> readAs w.custodian) do archiveCmd t
+  submit (actAs w.alice <> actAs w.custodian) do archiveCmd r
+  submit (actAs w.bob <> actAs w.custodian) do archiveCmd d2
+  submit (actAs w.sponsor <> actAs w.custodian) do archiveCmd t
+  submit w.custodian do archiveCmd seeded.ledger
+  submit w.custodian do archiveCmd w.manager
+
+-- | The last holder redeeming everything empties the vault completely.
+testFullExit : Script ()
+testFullExit = script do
+  w <- world
+  d <- placeDeposit w w.alice 10.0 0.0 "seed"
+  seeded <- runBatch w w.ledger [DepositRef d]
+  r <- placeRedeem w w.alice 10.0 10.0 "exit"
+  report <- runBatch w seeded.ledger [RedeemRef r]
+  book <- checkBalances w report.ledger
+  book.managedAssets === 0.0
+  book.issuedShares === 0.0
+  book.reserve === []
+
+-- | The custodian cannot run a batch itself, even holding a batch role.
+testCustodianCannotBatch : Script ()
+testCustodianCannotBatch = script do
+  w <- world
+  own <- giveRole w.custodian w.manager w.custodian "batch"
+  d <- placeDeposit w w.alice 1.0 0.0 "own"
+  failsVault "batcher-is-custodian" $ trySubmit (actAs w.custodian <> readAs w.alice <> readAs w.registrar) do
+    exerciseCmd w.manager VaultManager_RunBatch with
+      ledger = w.ledger; orders = [DepositRef d]; underlyingArgs = noArgs; authorization = own
+
+-- Stale orders and cleanup
+---------------------------
+
+-- | Two orders on one allocation cannot both execute, and the leftover can be abandoned.
+testTwoOrdersOneAllocation : Script ()
+testTwoOrdersOneAllocation = script do
+  w <- world
+  d <- placeDeposit w w.alice 10.0 0.0 "twice"
+  Some first <- queryContractId w.alice d
+  let allocation = first.spec.allocation
+      deadline = first.spec.deadline
+  copy <- submit (actAs w.alice <> readAs w.custodian <> readAs w.registrar) do
+    exerciseCmd w.manager VaultManager_PlaceDeposit with
+      holder = w.alice; allocation; amount = 10.0; minShares = 0.0; deadline
+  let abandonEarly = failsVault "abandon-before-deadline" $ trySubmit w.alice do
+        exerciseCmd copy DepositOrder_Abandon
+  abandonEarly
+  batchMissing w w.ledger [DepositRef d, DepositRef copy]
+  _ <- checkBalances w w.ledger
+  report <- runBatch w w.ledger [DepositRef d]
+  batchMissing w report.ledger [DepositRef copy]
+  setTime deadline
+  abandonEarly
+  setTime (deadline `addRelTime` seconds 1)
+  failsAuth $ trySubmit (actAs w.bob <> readAs w.alice <> readAs w.custodian) do
+    exerciseCmd copy DepositOrder_Abandon
+  failsMissing $ trySubmit w.alice do exerciseCmd copy DepositOrder_Withdraw with extraArgs = noArgs
+  submit w.alice do exerciseCmd copy DepositOrder_Abandon
+  None <- queryContractId w.alice copy
+  _ <- checkBalances w report.ledger
+  pure ()
+
+-- | Abandon closes an expired order whose allocation was withdrawn directly.
+testAbandonAfterDirectWithdraw : Script ()
+testAbandonAfterDirectWithdraw = script do
+  w <- world
+  d <- placeDeposit w w.alice 10.0 0.0 "seed"
+  seeded <- runBatch w w.ledger [DepositRef d]
+  r <- placeRedeem w w.alice 1.0 0.0 "redeem"
+  t <- placeTopUp w 1.0 "top-up"
+  failsVault "abandon-before-deadline" $ trySubmit w.alice do exerciseCmd r RedeemOrder_Abandon
+  failsVault "abandon-before-deadline" $ trySubmit w.sponsor do exerciseCmd t TopUpOrder_Abandon
+  Some redeemOrder <- queryContractId w.alice r
+  Some topUpOrder <- queryContractId w.sponsor t
+  setTime (t0 `addRelTime` seconds 301)
+  _ <- submit (actAs w.alice <> readAs w.custodian) do
+    exerciseCmd redeemOrder.spec.allocation A.Allocation_Withdraw with actors = [w.alice]; extraArgs = noArgs
+  _ <- submit (actAs w.sponsor <> readAs w.custodian <> readAs w.registrar) do
+    exerciseCmd topUpOrder.spec.allocation A.Allocation_Withdraw with actors = [w.sponsor]; extraArgs = noArgs
+  failsMissing $ trySubmit w.alice do exerciseCmd r RedeemOrder_Withdraw with extraArgs = noArgs
+  failsMissing $ trySubmit w.sponsor do exerciseCmd t TopUpOrder_Withdraw with extraArgs = noArgs
+  failsAuth $ trySubmit (actAs w.bob <> readAs w.alice) do exerciseCmd r RedeemOrder_Abandon
+  failsAuth $ trySubmit (actAs w.bob <> readAs w.sponsor) do exerciseCmd t TopUpOrder_Abandon
+  submit w.alice do exerciseCmd r RedeemOrder_Abandon
+  submit w.sponsor do exerciseCmd t TopUpOrder_Abandon
+  None <- queryContractId w.alice r
+  None <- queryContractId w.sponsor t
+  _ <- checkBalances w seeded.ledger
+  pure ()
+
+-- Terms and pricing guards
+---------------------------
+
+-- | The sponsor and the underlying must differ from the custodian and its shares,
+-- and the custodian cannot place an order in its own vault.
+testTermsGuards : Script ()
+testTermsGuards = script do
+  w <- world
+  failsNative "PreconditionFailed" $ trySubmit w.custodian do
+    createCmd VaultManager with terms = w.terms with sponsor = w.custodian
+  failsNative "PreconditionFailed" $ trySubmit w.custodian do
+    createCmd VaultManager with terms = w.terms with underlying = H.InstrumentId w.custodian w.terms.shareId
+  let deadline = t0 `addRelTime` minutes 5
+  allocation <- lockUnderlying w w.custodian 1.0 deadline "custodian-order"
+  failsVault "holder-is-custodian" $ trySubmit (actAs w.custodian <> readAs w.registrar) do
+    exerciseCmd w.manager VaultManager_PlaceDeposit with
+      holder = w.custodian; allocation; amount = 1.0; minShares = 0.0; deadline
+
+-- | A book with one side at zero cannot price orders, so they are deferred.
+-- Only a fully empty book prices a first deposit at one to one.
+testUnpricedBook : Script ()
+testUnpricedBook = script do
+  w <- world
+  seed <- placeDeposit w w.alice 2.0 0.0 "seed"
+  seeded <- runBatch w w.ledger [DepositRef seed]
+  book <- checkBalances w seeded.ledger
+  d <- placeDeposit w w.bob 1.0 0.0 "deposit"
+  r <- placeRedeem w w.alice 1.0 0.0 "redeem"
+  forA_ [(book with issuedShares = 0.0), Book 0.0 2.0 []] $ \opening -> do
+    forged <- submit w.custodian do
+      createCmd VaultLedger with
+        custodian = w.custodian; manager = w.manager; book = opening; halted = False; previous = None
+    report <- runBatch w forged [DepositRef d, RedeemRef r]
+    report.ledger === forged
+    report.executed === []
+    length report.deferred === 2
+    submit w.custodian do archiveCmd forged
+  _ <- checkBalances w seeded.ledger
+  pure ()
+
+-- | Executing an order outside a batch reports the exact pricing failure.
+testPricingErrors : Script ()
+testPricingErrors = script do
+  w <- world
+  greedy <- placeDeposit w w.alice 10.0 11.0 "greedy"
+  result <- executeDeposit' w greedy emptyBook
+  case result of
+    Left (FailureStatusError status) -> do
+      status.errorId === "canton-solutions/vault-below-min-shares"
+      TextMap.lookup "minimum" status.meta === Some (show (11.0 : Decimal))
+      TextMap.lookup "quote" status.meta === Some (show (10.0 : Decimal))
+    Left err -> abort (show err)
+    Right _ -> abort "the minimum was not enforced"
+  dust <- placeDeposit w w.alice 0.0000000001 0.0 "dust"
+  failsVault "zero-output" $ executeDeposit' w dust (Book 2.0 1.0 [])
+  failsVault "bad-price-input" $ executeDeposit' w dust (Book 0.0 1.0 [])
+  seed <- placeDeposit w w.bob 10.0 0.0 "seed"
+  seeded <- runBatch w w.ledger [DepositRef seed]
+  book <- checkBalances w seeded.ledger
+  r <- placeRedeem w w.bob 1.0 2.0 "greedy-redeem"
+  let executeRedeem' at = trySubmit (actAs w.custodian <> readAs w.bob <> readAs w.registrar) do
+        exerciseCmd r RedeemOrder_Execute with book = at; underlyingArgs = noArgs
+  failsVault "below-min-assets" $ executeRedeem' book
+  failsVault "zero-output" $ executeRedeem' (Book 0.0000000001 2.0 [])
+  failsVault "bad-price-input" $ executeRedeem' (Book 1.0 0.0 [])
+  _ <- checkBalances w seeded.ledger
+  pure ()

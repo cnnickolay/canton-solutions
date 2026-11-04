@@ -1,0 +1,332 @@
+-- | Sharded batches, folds, top-ups, halts and the checks around them.
+module CantonSolutions.Vault.ShardedTest.Shards where
+
+import DA.Assert ((===))
+import DA.List (sort, sortOn, (!!))
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, seconds)
+
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocInstr
+import Splice.Api.Token.AllocationV2 qualified as A
+import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils (basicAccount)
+
+import CantonSolutions.Token
+
+import CantonSolutions.Vault.Roles
+import CantonSolutions.Vault.Settlement (noArgs)
+import CantonSolutions.Vault.Sharded
+import CantonSolutions.Vault.ShardedTest.Setup
+
+shardAt : [ContractId Shard] -> Int -> ContractId Shard
+shardAt shards i = shards !! i
+
+shardAssets : World -> [ContractId Shard] -> Script [Decimal]
+shardAssets w shards = forA shards $ \cid -> do
+  Some s <- queryContractId w.custodian cid
+  pure s.book.assets
+
+-- | Two shards take deposits from the same board, independently. A fold adds
+-- them up and splits the reserve evenly.
+testParallelShardsAndFold : Script ()
+testParallelShardsAndFold = script do
+  w <- world 2
+  a <- placeDeposit w "a" w.alice 10.0 10.0
+  b <- placeDeposit w "b" w.bob 30.0 30.0
+  onFirst <- runBatch w w.board (shardAt w.shards 0) [DepositRef a]
+  onSecond <- runBatch w w.board (shardAt w.shards 1) [DepositRef b]
+  onFirst.executed === [Execution (DepositRef a) 10.0]
+  onSecond.executed === [Execution (DepositRef b) 30.0]
+  totals <- checkBalances w w.board [onFirst.shard, onSecond.shard]
+  totals === (40.0, 40.0)
+  folded <- runFold w w.board [onFirst.shard, onSecond.shard] []
+  Some board <- queryContractId w.custodian folded.board
+  (board.generation, board.managedAssets, board.issuedShares) === (1, 40.0, 40.0)
+  totals <- checkBalances w folded.board folded.shards
+  totals === (40.0, 40.0)
+  split <- shardAssets w folded.shards
+  split === [20.0, 20.0]
+
+-- | One batch settles deposits and redemptions together.
+testMixedBatch : Script ()
+testMixedBatch = script do
+  w <- world 1
+  seed <- placeDeposit w "seed" w.alice 100.0 0.0
+  seeded <- runBatch w w.board (shardAt w.shards 0) [DepositRef seed]
+  t <- placeTopUp w "top-up" 25.0
+  folded <- runFold w w.board [seeded.shard] [t]
+  setTime (t0 `addRelTime` seconds 1)
+  d1 <- placeDeposit w "d1" w.bob 50.0 0.0
+  r1 <- placeRedeem w "r1" w.alice 20.0 0.0
+  d2 <- placeDeposit w "d2" w.bob 5.0 0.0
+  r2 <- placeRedeem w "r2" w.alice 8.0 0.0
+  report <- runBatch w folded.board (shardAt folded.shards 0) [RedeemRef r2, DepositRef d2, RedeemRef r1, DepositRef d1]
+  sortOn (.order) report.executed === sortOn (.order)
+    [Execution (DepositRef d1) 40.0, Execution (RedeemRef r1) 25.0, Execution (DepositRef d2) 4.0, Execution (RedeemRef r2) 10.0]
+  report.deferred === []
+  totals <- checkBalances w folded.board [report.shard]
+  totals === (145.0, 116.0)
+
+-- | A top-up only runs in a fold, and lifts the price on every shard at once.
+testTopUpInFoldRaisesEveryShard : Script ()
+testTopUpInFoldRaisesEveryShard = script do
+  w <- world 2
+  a <- placeDeposit w "a" w.alice 10.0 0.0
+  b <- placeDeposit w "b" w.bob 10.0 0.0
+  s0 <- runBatch w w.board (shardAt w.shards 0) [DepositRef a]
+  s1 <- runBatch w w.board (shardAt w.shards 1) [DepositRef b]
+  t <- placeTopUp w "top-up" 5.0
+  failsVault "top-up-outside-fold" $ trySubmit (asBatcher w) (batchCmd w w.board s0.shard [TopUpRef t])
+  folded <- runFold w w.board [s0.shard, s1.shard] [t]
+  folded.executed === [Execution (TopUpRef t) 0.0]
+  Some board <- queryContractId w.custodian folded.board
+  (board.managedAssets, board.issuedShares) === (25.0, 20.0)
+  _ <- checkBalances w folded.board folded.shards
+  setTime (t0 `addRelTime` seconds 1)
+  c <- placeDeposit w "c" w.alice 5.0 0.0
+  d <- placeDeposit w "d" w.bob 5.0 0.0
+  r0 <- runBatch w folded.board (shardAt folded.shards 0) [DepositRef c]
+  r1 <- runBatch w folded.board (shardAt folded.shards 1) [DepositRef d]
+  map (.amountOut) (r0.executed <> r1.executed) === [4.0, 4.0]
+  _ <- checkBalances w folded.board [r0.shard, r1.shard]
+  pure ()
+
+-- | Every order in a generation gets the board price, whatever its position.
+testBoardPriceForEveryOrder : Script ()
+testBoardPriceForEveryOrder = script do
+  w <- world 1
+  seed <- placeDeposit w "seed" w.alice 100.0 0.0
+  s <- runBatch w w.board (shardAt w.shards 0) [DepositRef seed]
+  t <- placeTopUp w "top-up" 30.0
+  folded <- runFold w w.board [s.shard] [t]
+  setTime (t0 `addRelTime` seconds 1)
+  d1 <- placeDeposit w "d1" w.bob 13.0 0.0
+  d2 <- placeDeposit w "d2" w.bob 13.0 0.0
+  report <- runBatch w folded.board (shardAt folded.shards 0) [DepositRef d2, DepositRef d1]
+  map (.amountOut) report.executed === [10.0, 10.0]
+  _ <- checkBalances w folded.board [report.shard]
+  pure ()
+
+-- | A redemption bigger than one shard's reserve is deferred on the shard and
+-- executed by a fold against the whole reserve.
+testLargeRedemptionInFold : Script ()
+testLargeRedemptionInFold = script do
+  w <- world 2
+  a <- placeDeposit w "a" w.alice 10.0 0.0
+  s0 <- runBatch w w.board (shardAt w.shards 0) [DepositRef a]
+  first <- runFold w w.board [s0.shard, shardAt w.shards 1] []
+  split <- shardAssets w first.shards
+  split === [5.0, 5.0]
+  setTime (t0 `addRelTime` seconds 1)
+  big <- placeRedeem w "big" w.alice 8.0 0.0
+  small <- placeRedeem w "small" w.alice 1.0 0.0
+  short <- runBatch w first.board (shardAt first.shards 0) [RedeemRef big, RedeemRef small]
+  short.executed === [Execution (RedeemRef small) 1.0]
+  short.deferred === [RedeemRef big]
+  second <- submit (asBatcher w) (foldCmd w first.board [short.shard, shardAt first.shards 1] [] [RedeemRef big])
+  second.executed === [Execution (RedeemRef big) 8.0]
+  totals <- checkBalances w second.board second.shards
+  totals === (1.0, 1.0)
+  split <- shardAssets w second.shards
+  split === [0.5, 0.5]
+
+-- | The last holder can leave completely through a fold.
+testFullExitThroughFold : Script ()
+testFullExitThroughFold = script do
+  w <- world 3
+  a <- placeDeposit w "a" w.alice 9.0 0.0
+  s0 <- runBatch w w.board (shardAt w.shards 0) [DepositRef a]
+  first <- runFold w w.board [s0.shard, shardAt w.shards 1, shardAt w.shards 2] []
+  setTime (t0 `addRelTime` seconds 1)
+  out <- placeRedeem w "out" w.alice 9.0 9.0
+  second <- submit (asBatcher w) (foldCmd w first.board first.shards [] [RedeemRef out])
+  second.executed === [Execution (RedeemRef out) 9.0]
+  totals <- checkBalances w second.board second.shards
+  totals === (0.0, 0.0)
+
+-- | Two orders with the same leg id cannot settle together. The second waits.
+testDuplicateLegIdIsDeferred : Script ()
+testDuplicateLegIdIsDeferred = script do
+  w <- world 1
+  a <- placeDeposit w "same" w.alice 1.0 0.0
+  b <- placeDeposit w "same" w.bob 2.0 0.0
+  report <- runBatch w w.board (shardAt w.shards 0) [DepositRef a, DepositRef b]
+  length report.executed === 1
+  length report.deferred === 1
+  later <- runBatch w w.board report.shard report.deferred
+  length later.executed === 1
+  _ <- checkBalances w w.board [later.shard]
+  pure ()
+
+-- | Orders must name the vault settlement and may not use the vault's own leg ids.
+testAllocationRules : Script ()
+testAllocationRules = script do
+  w <- world 1
+  deadline <- deadlineIn5 ()
+  let lockWith settlement label = do
+        holding <- submit (actAs w.registrar <> actAs w.alice) do
+          createCmd TokenHolding with
+            admin = w.registrar; owner = w.alice; instrument = "USD"; amount = 1.0; lock = None
+        now <- getTime
+        result <- submit (actAs w.alice <> readAs w.registrar <> readAs w.custodian) do
+          exerciseCmd (toInterfaceContractId @AllocInstr.AllocationFactory w.underlyingRules) AllocInstr.AllocationFactory_Allocate with
+            settlement
+            allocation = lockSpec label w.registrar w.alice (basicAccount w.custodian) "USD" 1.0 deadline
+            requestedAt = now; inputHoldingCids = [toInterfaceContractId holding]; actors = [w.alice]; extraArgs = noArgs
+        case result.output of
+          AllocInstr.AllocationInstructionResult_Completed cid -> pure cid
+          _ -> abort "allocation did not complete"
+      place allocation = trySubmit (actAs w.alice <> readAs w.custodian <> readAs w.registrar) do
+        exerciseCmd w.manager ShardedManager_PlaceDeposit with
+          holder = w.alice; allocation; amount = 1.0; minShares = 0.0; deadline
+  own <- lockWith (A.SettlementInfo [w.custodian] "private" None emptyMetadata) "mine"
+  failsVault "allocation-wrong-settlement" (place own)
+  reserved <- lockWith (vaultSettlement w.custodian w.manager) "vault/mint/x"
+  failsVault "reserved-leg-id" (place reserved)
+
+-- | After a fold, the old board and shards are gone, so in-flight batches fail and retry.
+testFoldInvalidatesOldInputs : Script ()
+testFoldInvalidatesOldInputs = script do
+  w <- world 2
+  a <- placeDeposit w "a" w.alice 10.0 0.0
+  folded <- runFold w w.board w.shards []
+  failsMissing $ trySubmit (asBatcher w) (batchCmd w w.board (shardAt w.shards 0) [DepositRef a])
+  failsMissing $ trySubmit (asBatcher w) (batchCmd w folded.board (shardAt w.shards 0) [DepositRef a])
+  report <- runBatch w folded.board (shardAt folded.shards 0) [DepositRef a]
+  report.executed === [Execution (DepositRef a) 10.0]
+
+-- | A fold needs exactly the K current shards of this vault.
+testFoldNeedsTheWholeSet : Script ()
+testFoldNeedsTheWholeSet = script do
+  w <- world 3
+  failsVault "shard-set" $ trySubmit (asBatcher w) (foldCmd w w.board (take 2 w.shards) [] [])
+  failsVault "duplicate-order" $ trySubmit (asBatcher w) (foldCmd w w.board (w.shards <> take 1 w.shards) [] [])
+  other <- world 3
+  -- Another vault's shard is signed by another custodian, so the ledger refuses the fetch itself.
+  failsAuth $ trySubmit (asBatcher w <> readAs other.custodian)
+    (foldCmd w w.board (take 2 w.shards <> drop 2 other.shards) [] [])
+
+-- | Halting replaces the board and stops batches and folds on every shard.
+testHaltStopsAllShards : Script ()
+testHaltStopsAllShards = script do
+  w <- world 2
+  a <- placeDeposit w "a" w.alice 10.0 0.0
+  halted <- submit (actAs w.warden <> readAs w.custodian) do
+    exerciseCmd w.manager ShardedManager_Halt with board = w.board; authorization = w.haltRole
+  let failsHalted = failsVault "halted"
+  failsHalted $ trySubmit (asBatcher w) (batchCmd w halted (shardAt w.shards 0) [DepositRef a])
+  failsHalted $ trySubmit (asBatcher w) (batchCmd w halted (shardAt w.shards 1) [DepositRef a])
+  failsHalted $ trySubmit (asBatcher w) (foldCmd w halted w.shards [] [])
+  live <- submit (actAs w.warden <> readAs w.custodian) do
+    exerciseCmd w.manager ShardedManager_Resume with board = halted; authorization = w.resumeRole
+  report <- runBatch w live (shardAt w.shards 1) [DepositRef a]
+  report.executed === [Execution (DepositRef a) 10.0]
+
+-- | Batch and fold are separate permissions, and the custodian cannot act as batcher.
+testRolesAreSeparate : Script ()
+testRolesAreSeparate = script do
+  w <- world 2
+  a <- placeDeposit w "a" w.alice 10.0 0.0
+  failsVault "role-wrong-scope" $ trySubmit (asBatcher w) do
+    exerciseCmd w.manager ShardedManager_Fold with
+      board = w.board; shards = w.shards; topUps = []; orders = []; underlyingArgs = noArgs
+      authorization = w.batchRole
+  failsAuth $ trySubmit (actAs w.bob <> readAs (readers w)) (batchCmd w w.board (shardAt w.shards 0) [DepositRef a])
+  own <- giveRole w.custodian w.manager w.custodian "batch"
+  failsVault "batcher-is-custodian" $ trySubmit (actAs w.custodian <> readAs (readers w)) do
+    exerciseCmd w.manager ShardedManager_RunBatch with
+      board = w.board; shard = shardAt w.shards 0; orders = [DepositRef a]
+      underlyingArgs = noArgs; authorization = own
+  submit w.custodian do exerciseCmd w.batchRole.role VaultRole_Revoke
+  failsMissing $ trySubmit (asBatcher w) (batchCmd w w.board (shardAt w.shards 0) [DepositRef a])
+
+-- | Minimums, zero output and an unpriced board defer orders instead of failing the batch.
+testDeferrals : Script ()
+testDeferrals = script do
+  w <- world 1
+  r0 <- placeDeposit w "seed" w.alice 10.0 0.0
+  seeded <- runBatch w w.board (shardAt w.shards 0) [DepositRef r0]
+  early <- placeRedeem w "early" w.alice 1.0 0.0
+  unpriced <- runBatch w w.board seeded.shard [RedeemRef early]
+  unpriced.deferred === [RedeemRef early]
+  t <- placeTopUp w "top-up" 10.0
+  folded <- runFold w w.board [seeded.shard] [t]
+  greedy <- placeDeposit w "greedy" w.bob 10.0 6.0
+  dust <- placeDeposit w "dust" w.bob 0.0000000001 0.0
+  report <- runBatch w folded.board (shardAt folded.shards 0) [DepositRef greedy, DepositRef dust, RedeemRef early]
+  sort report.deferred === sort [DepositRef greedy, DepositRef dust]
+  report.executed === [Execution (RedeemRef early) 2.0]
+  _ <- checkBalances w folded.board [report.shard]
+  pure ()
+
+-- | A fold only takes redemptions in `orders`, and runs top-ups after them.
+testFoldTakesRedemptionsOnly : Script ()
+testFoldTakesRedemptionsOnly = script do
+  w <- world 1
+  d <- placeDeposit w "d" w.alice 1.0 0.0
+  failsVault "deposit-in-fold" $ trySubmit (asBatcher w) (foldCmd w w.board w.shards [] [DepositRef d])
+
+-- | Two top-ups on one allocation: the first runs, the second is deferred.
+testTopUpsShareNoAllocation : Script ()
+testTopUpsShareNoAllocation = script do
+  w <- world 1
+  seed <- placeDeposit w "seed" w.alice 10.0 0.0
+  seeded <- runBatch w w.board (shardAt w.shards 0) [DepositRef seed]
+  deadline <- deadlineIn5 ()
+  allocation <- lockUsd w "shared" w.sponsor 2.0 deadline
+  let place = submit (actAs w.sponsor <> readAs w.custodian <> readAs w.registrar) do
+        exerciseCmd w.manager ShardedManager_PlaceTopUp with allocation; amount = 2.0; deadline
+  t1 <- place
+  t2 <- place
+  folded <- runFold w w.board [seeded.shard] [t1, t2]
+  length folded.executed === 1
+  length folded.deferred === 1
+  totals <- checkBalances w folded.board folded.shards
+  totals === (12.0, 10.0)
+
+-- | When the last shares leave, rounding dust leaves the book too, so the next
+-- depositor starts from an empty vault and cannot collect the dust.
+testDustLeavesWithTheLastShare : Script ()
+testDustLeavesWithTheLastShare = script do
+  w <- world 1
+  seed <- placeDeposit w "seed" w.alice 3.0 0.0
+  seeded <- runBatch w w.board (shardAt w.shards 0) [DepositRef seed]
+  t <- placeTopUp w "top-up" 1.0
+  first <- runFold w w.board [seeded.shard] [t]
+  setTime (t0 `addRelTime` seconds 1)
+  r1 <- placeRedeem w "r1" w.alice 1.0 0.0
+  r2 <- placeRedeem w "r2" w.alice 2.0 0.0
+  out <- runBatch w first.board (shardAt first.shards 0) [RedeemRef r1, RedeemRef r2]
+  sort (map (.amountOut) out.executed) === [1.3333333333, 2.6666666666]
+  second <- runFold w first.board [out.shard] []
+  Some board <- queryContractId w.custodian second.board
+  (board.managedAssets, board.issuedShares) === (0.0, 0.0)
+  totals <- checkBalances w second.board second.shards
+  totals === (0.0, 0.0)
+  fresh <- placeDeposit w "fresh" w.bob 5.0 0.0
+  report <- runBatch w second.board (shardAt second.shards 0) [DepositRef fresh]
+  report.executed === [Execution (DepositRef fresh) 5.0]
+
+-- | Holders may not attach metadata to their leg, since the vault signs its side of it.
+testLegMetaMustBeEmpty : Script ()
+testLegMetaMustBeEmpty = script do
+  w <- world 1
+  deadline <- deadlineIn5 ()
+  holding <- submit (actAs w.registrar <> actAs w.alice) do
+    createCmd TokenHolding with
+      admin = w.registrar; owner = w.alice; instrument = "USD"; amount = 1.0; lock = None
+  now <- getTime
+  let spec = lockSpec "meta" w.registrar w.alice (basicAccount w.custodian) "USD" 1.0 deadline
+      tagged = spec with transferLegSides = [side with meta = Metadata (TextMap.fromList [("note", "x")]) | side <- spec.transferLegSides]
+  result <- submit (actAs w.alice <> readAs w.registrar <> readAs w.custodian) do
+    exerciseCmd (toInterfaceContractId @AllocInstr.AllocationFactory w.underlyingRules) AllocInstr.AllocationFactory_Allocate with
+      settlement = vaultSettlement w.custodian w.manager; allocation = tagged
+      requestedAt = now; inputHoldingCids = [toInterfaceContractId holding]; actors = [w.alice]; extraArgs = noArgs
+  allocation <- case result.output of
+    AllocInstr.AllocationInstructionResult_Completed cid -> pure cid
+    _ -> abort "allocation did not complete"
+  failsVault "leg-meta-not-empty" $ trySubmit (actAs w.alice <> readAs w.custodian <> readAs w.registrar) do
+    exerciseCmd w.manager ShardedManager_PlaceDeposit with
+      holder = w.alice; allocation; amount = 1.0; minShares = 0.0; deadline

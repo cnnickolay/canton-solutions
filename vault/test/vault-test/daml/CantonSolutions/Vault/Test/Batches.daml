@@ -1,0 +1,91 @@
+-- | Batches execute atomically and price every order against running totals.
+module CantonSolutions.Vault.Test.Batches where
+
+import DA.Assert ((===))
+import DA.List (sort)
+import DA.Time (addRelTime, seconds)
+
+import Daml.Script
+
+import CantonSolutions.Vault.Manager
+import CantonSolutions.Vault.Test.Setup
+
+-- | A deposit, a top-up and a redemption, each in its own batch, keep the book
+-- equal to the real tokens.
+testLifecycle : Script ()
+testLifecycle = script do
+  w <- world
+  d <- placeDeposit w w.alice 10.0 10.0 "first"
+  first <- runBatch w w.ledger [DepositRef d]
+  book <- checkBalances w first.ledger
+  book.managedAssets === 10.0
+  book.issuedShares === 10.0
+  first.executed === [Execution (DepositRef d) 10.0]
+  setTime (t0 `addRelTime` seconds 1)
+  t <- placeTopUp w 5.0 "top-up"
+  topped <- runBatch w first.ledger [TopUpRef t]
+  book <- checkBalances w topped.ledger
+  book.managedAssets === 15.0
+  book.issuedShares === 10.0
+  setTime (t0 `addRelTime` seconds 2)
+  r <- placeRedeem w w.alice 2.0 3.0 "redeem"
+  redeemed <- runBatch w topped.ledger [RedeemRef r]
+  book <- checkBalances w redeemed.ledger
+  book.managedAssets === 12.0
+  book.issuedShares === 8.0
+
+-- | Integer model of executing orders one by one. True means deposit.
+model : (Int, Int) -> [(Bool, Int)] -> ((Int, Int), [Int])
+model totals [] = (totals, [])
+model (assets, shares) ((isDeposit, amount) :: rest) =
+  let out = if isDeposit then (amount * shares) / assets else (amount * assets) / shares
+      next = if isDeposit then (assets + amount, shares + out) else (assets - out, shares - amount)
+      (final, outs) = model next rest
+  in (final, out :: outs)
+
+ticks : Int -> Decimal
+ticks n = intToDecimal n * 0.0000000001
+
+-- | A mixed batch gives the same outputs as one-by-one execution, with the top-up last.
+testMatchesSequentialModel : Script ()
+testMatchesSequentialModel = script do
+  w <- world
+  seed <- placeDeposit w w.alice (ticks 100) 0.0 "seed"
+  seeded <- runBatch w w.ledger [DepositRef seed]
+  _ <- checkBalances w seeded.ledger
+  bump <- placeTopUp w (ticks 30) "bump"
+  priced <- runBatch w seeded.ledger [TopUpRef bump]
+  _ <- checkBalances w priced.ledger
+  late <- placeTopUp w (ticks 7) "late"
+  setTime (t0 `addRelTime` seconds 1)
+  d1 <- placeDeposit w w.bob (ticks 23) 0.0 "d1"
+  setTime (t0 `addRelTime` seconds 2)
+  r <- placeRedeem w w.alice (ticks 11) 0.0 "r"
+  setTime (t0 `addRelTime` seconds 3)
+  d2 <- placeDeposit w w.bob (ticks 19) 0.0 "d2"
+  report <- runBatch w priced.ledger [TopUpRef late, DepositRef d2, RedeemRef r, DepositRef d1]
+  let ((assets, shares), outs) = model (130, 100) [(True, 23), (False, 11), (True, 19)]
+  map (.amountOut) report.executed === map ticks outs <> [0.0]
+  map (.order) report.executed === [DepositRef d1, RedeemRef r, DepositRef d2, TopUpRef late]
+  book <- checkBalances w report.ledger
+  book.managedAssets === ticks (assets + 7)
+  book.issuedShares === ticks shares
+  Some current <- queryContractId w.custodian report.ledger
+  current.previous === Some priced.ledger
+
+-- | Orders placed at the same time run in a fixed order, and deferred orders stay open.
+testSameTimeOrders : Script ()
+testSameTimeOrders = script do
+  w <- world
+  d1 <- placeDeposit w w.alice 1.0 0.0 "same-a"
+  d2 <- placeDeposit w w.bob 2.0 0.0 "same-b"
+  let expected = sort [DepositRef d1, DepositRef d2]
+  report <- runBatch w w.ledger (reverse expected)
+  map (.order) report.executed === expected
+  _ <- checkBalances w report.ledger
+  r <- placeRedeem w w.alice 1.0 2.0 "too-greedy"
+  idle <- runBatch w report.ledger [RedeemRef r]
+  idle.deferred === [RedeemRef r]
+  idle.executed === []
+  _ <- checkBalances w idle.ledger
+  pure ()

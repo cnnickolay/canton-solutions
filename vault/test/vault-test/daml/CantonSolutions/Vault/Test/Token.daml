@@ -1,0 +1,139 @@
+-- | The token on its own: transfers, allocations and batch settlement.
+module CantonSolutions.Vault.Test.Token where
+
+import DA.Assert ((===))
+import DA.Time (addRelTime, hours, minutes, seconds)
+
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV2 qualified as AI
+import Splice.Api.Token.AllocationV2 qualified as A
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+import Splice.TokenStandard.Utils (basicAccount, mintAccount, receiverSide, senderSide)
+
+import CantonSolutions.Token
+import CantonSolutions.Vault.Settlement (noArgs)
+import CantonSolutions.Vault.Test.Setup (failsAuth, failsWith, t0)
+
+failsToken : Text -> Script (Either SubmitError a) -> Script ()
+failsToken name = failsWith ("canton-solutions/token-" <> name)
+
+balance : Party -> Party -> Script Decimal
+balance admin owner = do
+  hs <- query @TokenHolding owner
+  pure (sum [h.amount | (_, h) <- hs, h.admin == admin, h.owner == owner])
+
+-- | A self-transfer splits a holding, a transfer to someone else needs both parties.
+testTransfers : Script ()
+testTransfers = script do
+  admin <- allocateParty "admin"
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  setTime t0
+  rules <- submit admin do createCmd TokenRules with admin; maxLifetime = hours 1
+  h <- submit (actAs admin <> actAs alice) do
+    createCmd TokenHolding with admin; owner = alice; instrument = "USD"; amount = 10.0; lock = None
+  let factory = toInterfaceContractId @T.TransferFactory rules
+      transfer receiver amount inputs = T.Transfer with
+        sender = basicAccount alice; receiver = basicAccount receiver; amount
+        instrumentId = H.InstrumentId admin "USD"; requestedAt = t0
+        executeBefore = t0 `addRelTime` minutes 1; inputHoldingCids = inputs; meta = emptyMetadata
+  result <- submit (actAs alice <> readAs admin) do
+    exerciseCmd factory T.TransferFactory_Transfer with
+      transfer = transfer alice 4.0 [toInterfaceContractId h]; actors = [alice]; extraArgs = noArgs
+  length result.senderChangeCids === 1
+  balance admin alice >>= (=== 10.0)
+  failsAuth $ trySubmit (actAs alice <> readAs admin) do
+    exerciseCmd factory T.TransferFactory_Transfer with
+      transfer = transfer bob 1.0 result.senderChangeCids; actors = [alice, bob]; extraArgs = noArgs
+  failsToken "wrong-actors" $ trySubmit (actAs alice <> readAs admin) do
+    exerciseCmd factory T.TransferFactory_Transfer with
+      transfer = transfer bob 1.0 result.senderChangeCids; actors = [alice]; extraArgs = noArgs
+  _ <- submit (actAs alice <> actAs bob <> readAs admin) do
+    exerciseCmd factory T.TransferFactory_Transfer with
+      transfer = transfer bob 1.0 result.senderChangeCids; actors = [alice, bob]; extraArgs = noArgs
+  balance admin alice >>= (=== 9.0)
+  balance admin bob >>= (=== 1.0)
+
+-- | An allocation locks only what it needs. A batch must cover every side of
+-- every leg, and a committed allocation cannot be withdrawn before its deadline.
+testAllocationsAndSettlement : Script ()
+testAllocationsAndSettlement = script do
+  admin <- allocateParty "admin"
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  venue <- allocateParty "venue"
+  setTime t0
+  rules <- submit admin do createCmd TokenRules with admin; maxLifetime = hours 1
+  h <- submit (actAs admin <> actAs alice) do
+    createCmd TokenHolding with admin; owner = alice; instrument = "USD"; amount = 10.0; lock = None
+  let settlement = A.SettlementInfo [venue] "deal" None emptyMetadata
+      deadline = t0 `addRelTime` minutes 5
+      pay = A.TransferLeg "pay" (basicAccount alice) (basicAccount bob) 3.0 "USD" emptyMetadata
+      mint = A.TransferLeg "mint" mintAccount (basicAccount bob) 2.0 "USD" emptyMetadata
+      allocator = toInterfaceContractId @AI.AllocationFactory rules
+      allocate who account sides inputs = submit (actAs who <> readAs admin) do
+        exerciseCmd allocator AI.AllocationFactory_Allocate with
+          settlement
+          allocation = A.AllocationSpecification with
+            admin; authorizer = account; transferLegSides = sides
+            settlementDeadline = Some deadline; nextIterationFunding = None; committed = True; meta = emptyMetadata
+          requestedAt = t0; inputHoldingCids = inputs; actors = [who]; extraArgs = noArgs
+      completed r = case r.output of
+        AI.AllocationInstructionResult_Completed cid -> pure cid
+        _ -> abort "not completed"
+  fromAlice <- allocate alice (basicAccount alice) [senderSide pay] [toInterfaceContractId h]
+  aliceAlloc <- completed fromAlice
+  balance admin alice >>= (=== 10.0)
+  failsToken "committed-until-deadline" $ trySubmit (actAs alice <> readAs admin) do
+    exerciseCmd aliceAlloc A.Allocation_Withdraw with actors = [alice]; extraArgs = noArgs
+  toBob <- allocate bob (basicAccount bob) [receiverSide pay, receiverSide mint] [] >>= completed
+  minting <- allocate admin mintAccount [senderSide mint] [] >>= completed
+  let settler = toInterfaceContractId @A.SettlementFactory rules
+      settle legs allocations = trySubmit (actAs venue <> readAs admin <> readAs alice <> readAs bob) do
+        exerciseCmd settler A.SettlementFactory_SettleBatch with
+          settlement; transferLegs = legs; allocations = map (\c -> A.FinalizedAllocation c [] None) allocations
+          actors = [venue]; extraArgs = noArgs
+  failsToken "legs-not-covered" (settle [pay, mint] [aliceAlloc, toBob])
+  Right _ <- settle [pay, mint] [aliceAlloc, toBob, minting]
+  balance admin alice >>= (=== 7.0)
+  balance admin bob >>= (=== 5.0)
+
+-- | After the deadline the owner gets locked funds back.
+testWithdrawAfterDeadline : Script ()
+testWithdrawAfterDeadline = script do
+  admin <- allocateParty "admin"
+  alice <- allocateParty "alice"
+  venue <- allocateParty "venue"
+  setTime t0
+  rules <- submit admin do createCmd TokenRules with admin; maxLifetime = hours 1
+  h <- submit (actAs admin <> actAs alice) do
+    createCmd TokenHolding with admin; owner = alice; instrument = "USD"; amount = 10.0; lock = None
+  let leg = A.TransferLeg "out" (basicAccount alice) (basicAccount venue) 4.0 "USD" emptyMetadata
+  r <- submit (actAs alice <> readAs admin) do
+    exerciseCmd (toInterfaceContractId @AI.AllocationFactory rules) AI.AllocationFactory_Allocate with
+      settlement = A.SettlementInfo [venue] "deal" None emptyMetadata
+      allocation = A.AllocationSpecification with
+        admin; authorizer = basicAccount alice; transferLegSides = [senderSide leg]
+        settlementDeadline = Some (t0 `addRelTime` minutes 5); nextIterationFunding = None
+        committed = True; meta = emptyMetadata
+      requestedAt = t0; inputHoldingCids = [toInterfaceContractId h]; actors = [alice]; extraArgs = noArgs
+  AI.AllocationInstructionResult_Completed cid <- pure r.output
+  setTime (t0 `addRelTime` (minutes 5 + seconds 1))
+  _ <- submit (actAs alice <> readAs admin) do
+    exerciseCmd cid A.Allocation_Withdraw with actors = [alice]; extraArgs = noArgs
+  hs <- query @TokenHolding alice
+  [h.lock | (_, h) <- hs] === [None, None]
+  balance admin alice >>= (=== 10.0)
+
+-- | A mint offer becomes a holding once the owner accepts it.
+testMintOffer : Script ()
+testMintOffer = script do
+  admin <- allocateParty "admin"
+  alice <- allocateParty "alice"
+  offer <- submit admin do createCmd TokenOffer with admin; owner = alice; instrument = "USD"; amount = 5.0
+  failsAuth $ trySubmit admin do exerciseCmd offer TokenOffer_Accept
+  _ <- submit alice do exerciseCmd offer TokenOffer_Accept
+  balance admin alice >>= (=== 5.0)

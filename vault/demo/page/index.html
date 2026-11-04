@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vault demo</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="title"><span class="logo">V</span><div>Batched vault<small>Local Canton sandbox</small></div></div>
+  <div class="status"><span id="link" class="pill">Connecting</span><span class="muted">LF 2.1, real CIP-0112 allocations</span></div>
+</header>
+<main>
+  <div class="left">
+    <section class="card">
+      <div class="head"><h1>Book</h1><span id="halted" class="pill">Starting</span></div>
+      <div class="metrics">
+        <div><label>Managed assets</label><strong id="managed">-</strong><small>USD</small></div>
+        <div><label>Issued shares</label><strong id="issued">-</strong><small>vUSD</small></div>
+        <div><label>USD per share</label><strong id="price">1.0000</strong><small>Current price, not a promise</small></div>
+      </div>
+      <canvas id="chart" height="80"></canvas>
+      <div class="stats"><span><b id="batch-count">0</b> batches</span><span><b id="per-minute">0</b> per minute</span><span>last <b id="last-batch">-</b></span><span>ledger <code id="ledger-cid">-</code></span></div>
+      <div class="row"><button id="autorun" class="primary">Start batcher</button><button data-action="run">Run one batch</button><button id="halt">Halt</button><button data-action="check">Check balances</button></div>
+      <div id="balance" class="note">Waiting for the first snapshot</div>
+    </section>
+
+    <section class="card">
+      <div class="head"><h2>Wallets</h2><span class="muted">Free balances, locked amounts underneath</span></div>
+      <div id="wallet-totals" class="totals"></div>
+      <div class="scroll short"><table><thead><tr><th>Party</th><th>USD</th><th>vUSD</th><th>Worth</th><th></th></tr></thead><tbody id="wallets"></tbody></table></div>
+      <div class="row"><input id="new-name" value="Dave" aria-label="New holder name"><input id="new-funds" type="number" value="1000" min="1" aria-label="Starting USD"><button id="add-one">Add holder</button><button data-add="5">Add 5</button><button data-add="20">Add 20</button></div>
+    </section>
+
+    <section class="card">
+      <div class="head"><h2>Place an order</h2><span id="estimate" class="muted">Estimate -</span></div>
+      <div class="form">
+        <label>Holder<select id="holder"></select></label>
+        <label>Order<select id="kind"><option value="deposit">Deposit</option><option value="redeem">Redeem</option></select></label>
+        <label>Amount<input id="amount" type="number" min="0.0000000001" step="any" value="100"></label>
+        <label>Minimum out<input id="minimum" type="number" min="0" step="any" value="99"></label>
+        <label>Deadline, seconds<input id="lifetime" type="number" min="5" max="550" value="500"></label>
+        <button id="place" class="primary">Place order</button>
+      </div>
+      <div class="row"><label class="inline">Top-up <input id="top-up" type="number" min="0.0000000001" step="any" value="15"></label><button id="send-top-up">Sponsor top-up</button><span class="gap"></span><button id="dust">Dust deposit</button><button id="donate">Donate 1 USD</button></div>
+      <p class="note">Orders lock funds until they execute or are withdrawn. The batcher leaves out orders within 60 seconds of their deadline. A dust deposit only gets zero shares once the price is above 1.</p>
+    </section>
+
+    <section class="card">
+      <div class="head"><h2>Open orders <span id="open-count" class="count">0</span></h2><span class="muted">Up to 200 per batch, top-ups last</span></div>
+      <div class="scroll"><table><thead><tr><th>Who</th><th>Amount</th><th>Deadline</th><th>Allocation</th><th></th></tr></thead><tbody id="orders"></tbody></table></div>
+    </section>
+
+    <section class="card">
+      <div class="head"><h2>Roles</h2><div class="row tight"><button data-role="Batcher">New batcher</button><button data-role="Warden">New warden</button></div></div>
+      <div id="roles" class="chips"></div>
+      <p class="note">The custodian gives every role. A new batcher or warden gets fresh roles and the old ones are revoked. The manager stays the same.</p>
+    </section>
+
+    <section class="card">
+      <div class="head"><h2>Load</h2><span id="load-state" class="pill">Stopped</span></div>
+      <div class="form">
+        <label>Active holders <output id="active-out">3</output><input id="active" type="range" min="1" max="3" value="3"></label>
+        <label>Orders per second <output id="rate-out">1</output><input id="rate" type="range" min="0.2" max="5" step="0.2" value="1"></label>
+        <label>Deposits <output id="mix-out">70%</output><input id="mix" type="range" min="0" max="100" step="10" value="70"></label>
+        <label>Amount from<input id="low" type="number" min="0.01" step="any" value="1"></label>
+        <label>Amount to<input id="high" type="number" min="0.01" step="any" value="5"></label>
+        <label>Top-up every seconds, 0 for never<input id="top-up-every" type="number" min="0" value="20"></label>
+        <label>Top-up amount<input id="top-up-amount" type="number" min="0" value="1"></label>
+        <button id="load" class="primary">Start load</button>
+      </div>
+      <p class="note">The rate is a target, not a measurement. Start the batcher separately. Busy or empty wallets are skipped.</p>
+    </section>
+
+    <div id="unresolved" class="note hidden"><button data-action="reconcile">Reconcile</button> An action has no known outcome yet. It is not resent blindly.</div>
+  </div>
+
+  <aside class="right">
+    <section class="batches">
+      <div class="head"><h2>Batches</h2><span class="muted">Last six, as committed</span></div>
+      <div class="next"><div class="head"><h3>Waiting</h3><span id="waiting-count" class="muted">0 open</span></div><div id="waiting" class="tiles"></div></div>
+      <div id="cards"><div class="empty">Batches show up here once they run</div></div>
+    </section>
+    <section class="feed-box">
+      <div class="head"><div><span class="eyebrow">Committed transactions</span><h2>Ledger</h2></div><button id="freeze">Pause view</button></div>
+      <div class="legend"><span class="order">Orders</span><span class="batch">Batches</span><span class="state">Book</span><span class="role">Roles</span><span class="error">Errors</span></div>
+      <div id="feed" role="log" aria-label="Ledger transactions"><div class="empty">Waiting for transactions</div></div>
+      <div class="foot">Newest first. Service messages are labelled. Times in UTC.</div>
+    </section>
+  </aside>
+</main>
+<div id="toast" role="status"></div>
+<script src="/app.js"></script>
+</body>
+</html>

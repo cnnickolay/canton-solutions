@@ -1,0 +1,77 @@
+-- | Share price arithmetic. Exact to one Decimal tick, with the rounding
+-- direction chosen per operation so the vault never loses value.
+module CantonSolutions.Vault.Math
+  ( Rounding (..)
+  , tick
+  , mulDiv
+  , positive
+  , quoteDeposit
+  , quoteRedeem
+  , depositShares
+  , redeemAssets
+  , mintCost
+  , withdrawCost
+  ) where
+
+import DA.Numeric qualified as Numeric
+
+-- | Which way to round an inexact result.
+data Rounding = Floor | Ceil
+  deriving (Eq, Show)
+
+-- | The smallest positive Decimal.
+tick : Decimal
+tick = 0.0000000001
+
+-- | `x * y / z`, rounded to a whole tick. `None` unless all inputs are positive.
+-- The product is taken in whole ticks at scale 0, so nothing is lost before the
+-- division. A product beyond 10^38 ticks aborts with a native arithmetic error.
+mulDiv : Rounding -> Decimal -> Decimal -> Decimal -> Optional Decimal
+mulDiv rounding x y z
+  | x <= 0.0 || y <= 0.0 || z <= 0.0 = None
+  | otherwise =
+      let numerator = Numeric.mul @0 (Numeric.shift @0 x) (Numeric.shift @0 y)
+          denominator = Numeric.shift @0 z
+          nearest = Numeric.div @0 numerator denominator
+          remainder = numerator - Numeric.mul @0 nearest denominator
+          exact = case rounding of
+            Floor | remainder < 0.0 -> nearest - 1.0
+            Ceil | remainder > 0.0 -> nearest + 1.0
+            _ -> nearest
+      in Some (Numeric.shift @10 exact)
+
+-- | Keep a result only when it is above zero.
+positive : Decimal -> Optional Decimal
+positive x = if x > 0.0 then Some x else None
+
+-- | An empty vault prices one share per asset.
+isEmpty : Decimal -> Decimal -> Bool
+isEmpty managed issued = managed == 0.0 && issued == 0.0
+
+-- | Shares a deposit of `assets` would get, rounded down. Zero is a valid quote.
+quoteDeposit : Decimal -> Decimal -> Decimal -> Optional Decimal
+quoteDeposit assets managed issued
+  | assets > 0.0 && isEmpty managed issued = Some assets
+  | otherwise = mulDiv Floor assets issued managed
+
+-- | Assets a redemption of `shares` would pay, rounded down. Zero is a valid quote.
+quoteRedeem : Decimal -> Decimal -> Decimal -> Optional Decimal
+quoteRedeem shares managed issued = mulDiv Floor shares managed issued
+
+-- | Shares minted for a deposit, rounded down and above zero.
+depositShares : Decimal -> Decimal -> Decimal -> Optional Decimal
+depositShares assets managed issued = quoteDeposit assets managed issued >>= positive
+
+-- | Assets paid for a redemption, rounded down and above zero.
+redeemAssets : Decimal -> Decimal -> Decimal -> Optional Decimal
+redeemAssets shares managed issued = quoteRedeem shares managed issued >>= positive
+
+-- | Assets needed to mint exactly `shares`, rounded up.
+mintCost : Decimal -> Decimal -> Decimal -> Optional Decimal
+mintCost shares managed issued
+  | shares > 0.0 && isEmpty managed issued = Some shares
+  | otherwise = mulDiv Ceil shares managed issued >>= positive
+
+-- | Shares needed to withdraw exactly `assets`, rounded up.
+withdrawCost : Decimal -> Decimal -> Decimal -> Optional Decimal
+withdrawCost assets managed issued = mulDiv Ceil assets issued managed >>= positive

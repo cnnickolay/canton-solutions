@@ -1,0 +1,11 @@
+// Start the sequencer and mediator, then create the "vault" synchronizer.
+nodes.local.start()
+bootstrap.synchronizer(
+  synchronizerName = "vault",
+  sequencers = Seq(sequencer1),
+  mediators = Seq(mediator1),
+  synchronizerOwners = Seq(sequencer1),
+  synchronizerThreshold = PositiveInt.one,
+  staticSynchronizerParameters = StaticSynchronizerParameters.defaultsWithoutKMS(ProtocolVersion.forSynchronizer),
+)
+println("SYNCHRONIZER READY")

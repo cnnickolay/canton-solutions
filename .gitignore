@@ -1,0 +1,9 @@
+.daml/
+*.dar
+!**/dars/*.dar
+.venv/
+__pycache__/
+.DS_Store
+.idea/
+.vscode/
+log/

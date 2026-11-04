@@ -1,0 +1,111 @@
+-- | Thin wrappers over the CIP-0112 allocation and settlement interfaces.
+-- The vault never sees a token template, only these interfaces.
+module CantonSolutions.Vault.Settlement
+  ( noArgs
+  , heldUnder
+  , sumHoldings
+  , commit
+  , settleLegs
+  ) where
+
+import DA.Action (unless)
+import DA.Fail (failWithStatus)
+import DA.Foldable (forA_)
+import DA.List (unique)
+import DA.Optional (fromOptional, isNone)
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocInstr
+import Splice.Api.Token.AllocationV2 qualified as A
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils (basicAccount, nonIteratedAllocation)
+
+import CantonSolutions.Vault.Errors
+
+-- | Empty choice context and metadata.
+noArgs : ExtraArgs
+noArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+
+-- | Holdings returned for one instrument id.
+heldUnder : Text -> TextMap.TextMap [ContractId H.Holding] -> [ContractId H.Holding]
+heldUnder instrument = fromOptional [] . TextMap.lookup instrument
+
+-- | Sum holdings after checking each one is unique, unlocked, positive, of the
+-- expected instrument, in `owner`'s basic account and signed by admin and owner.
+sumHoldings : H.InstrumentId -> Party -> [ContractId H.Holding] -> Update Decimal
+sumHoldings instrument owner cids = do
+  unless (unique cids) (failWithStatus eHoldingDuplicate)
+  amounts <- forA cids $ \cid -> do
+    holding <- fetch cid
+    let v = view holding
+        signers = signatory holding
+    unless (v.instrumentId == instrument) (failWithStatus eHoldingWrongInstrument)
+    unless (v.account == basicAccount owner) (failWithStatus eHoldingWrongOwner)
+    unless (isNone v.lock) (failWithStatus eHoldingLocked)
+    unless (instrument.admin `elem` signers && owner `elem` signers)
+      (failWithStatus eHoldingUnsigned)
+    unless (v.amount > 0.0) (failWithStatus eHoldingNotPositive)
+    pure v.amount
+  pure (sum amounts)
+
+-- | Create a committed, non-iterated allocation and return it with any change.
+commit
+  : ContractId AllocInstr.AllocationFactory
+  -> Party
+  -> A.SettlementInfo
+  -> H.Account
+  -> [A.TransferLegSide]
+  -> [ContractId H.Holding]
+  -> Time
+  -> [Party]
+  -> ExtraArgs
+  -> Update (ContractId A.Allocation, [ContractId H.Holding])
+commit factory admin settlement authorizer sides inputs deadline actors extraArgs = do
+  factoryView <- exercise factory AllocInstr.AllocationFactory_PublicFetch with actors
+  unless (factoryView.admin == admin) (failWithStatus eAllocatorAdminMismatch)
+  now <- getTime
+  result <- exercise factory AllocInstr.AllocationFactory_Allocate with
+    settlement
+    allocation = A.AllocationSpecification with
+      admin
+      authorizer
+      transferLegSides = sides
+      settlementDeadline = Some deadline
+      nextIterationFunding = None
+      committed = True
+      meta = emptyMetadata
+    requestedAt = now
+    inputHoldingCids = inputs
+    actors
+    extraArgs
+  case result.output of
+    AllocInstr.AllocationInstructionResult_Completed cid ->
+      pure (cid, concatMap snd (TextMap.toList result.authorizerChangeCids))
+    _ -> failWithStatus eAllocationIncomplete
+
+-- | Settle exactly these legs with these allocations. Anything other than a
+-- final, non-iterated settlement of every allocation is a failure.
+settleLegs
+  : ContractId A.SettlementFactory
+  -> Party
+  -> Party
+  -> A.SettlementInfo
+  -> [A.TransferLeg]
+  -> [ContractId A.Allocation]
+  -> ExtraArgs
+  -> Update [A.AllocationResult]
+settleLegs factory admin executor settlement legs allocations extraArgs = do
+  factoryView <- exercise factory A.SettlementFactory_PublicFetch with actors = [executor]
+  unless (factoryView.admin == admin) (failWithStatus eSettlerAdminMismatch)
+  result <- exercise factory A.SettlementFactory_SettleBatch with
+    settlement
+    transferLegs = legs
+    allocations = map nonIteratedAllocation allocations
+    actors = [executor]
+    extraArgs
+  let results = result.allocationSettleResults
+  unless (length results == length allocations) (failWithStatus eSettlementResultsIncomplete)
+  forA_ results $ \r ->
+    unless (r.output == A.AllocationResult_Settled None) (failWithStatus eSettlementIncomplete)
+  pure results

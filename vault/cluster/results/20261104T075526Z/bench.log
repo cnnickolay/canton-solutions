@@ -1,0 +1,159 @@
+[05:12:07] DARs uploaded to both participants
+[05:17:37] vault open: batched, shards 1, 40 holders
+[05:17:56] holders funded
+[05:18:03] seeded: every holder has shares, price raised by the top-up
+[05:20:07] placed 4000 orders in 123.3s (32.4 orders/s)
+[05:20:13] settling the backlog
+[05:21:36] settled 4000 orders in 82.3s: 48.59 orders/s, 20 batches
+[05:21:49] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[05:21:58] DARs uploaded to both participants
+[05:27:31] vault open: sharded, shards 1, 40 holders
+[05:27:49] holders funded
+[05:27:56] seeded: every holder has shares, price raised by the top-up
+[05:29:47] placed 4000 orders in 111.6s (35.8 orders/s)
+[05:29:54] settling the backlog
+[05:31:00] settled 4000 orders in 66.0s: 60.57 orders/s, 20 batches
+[05:31:01] fold took 0.411s
+[05:31:10] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[05:31:17] DARs uploaded to both participants
+[05:37:19] vault open: sharded, shards 2, 40 holders
+[05:37:37] holders funded
+[05:37:44] seeded: every holder has shares, price raised by the top-up
+[05:39:34] placed 4000 orders in 110.0s (36.3 orders/s)
+[05:39:41] settling the backlog
+[05:40:14] settled 4000 orders in 32.8s: 121.99 orders/s, 21 batches
+[05:40:14] fold took 0.44s
+[05:40:23] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[05:40:31] DARs uploaded to both participants
+[05:46:19] vault open: sharded, shards 4, 40 holders
+[05:46:37] holders funded
+[05:46:44] seeded: every holder has shares, price raised by the top-up
+[05:48:34] placed 4000 orders in 110.0s (36.4 orders/s)
+[05:48:41] settling the backlog
+[05:49:04] settled 4000 orders in 22.6s: 177.26 orders/s, 23 batches
+[05:49:04] fold took 0.396s
+[05:49:13] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[05:49:21] DARs uploaded to both participants
+[05:54:53] vault open: sharded, shards 8, 40 holders
+[05:55:11] holders funded
+[05:55:20] seeded: every holder has shares, price raised by the top-up
+[05:57:11] placed 4000 orders in 111.0s (36.1 orders/s)
+[05:57:18] settling the backlog
+[05:57:37] settled 4000 orders in 19.5s: 205.59 orders/s, 24 batches
+[05:57:38] fold took 0.39s
+[05:57:47] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[05:57:55] DARs uploaded to both participants
+[06:03:31] vault open: sharded, shards 16, 40 holders
+[06:03:49] holders funded
+[06:04:01] seeded: every holder has shares, price raised by the top-up
+[06:05:45] placed 4000 orders in 104.2s (38.4 orders/s)
+[06:05:53] settling the backlog
+[06:06:13] settled 4000 orders in 20.7s: 193.66 orders/s, 32 batches
+[06:06:14] fold took 0.48s
+[06:06:23] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[06:06:31] DARs uploaded to both participants
+[06:12:18] vault open: batched, shards 1, 40 holders
+[06:12:36] holders funded
+[06:12:43] seeded: every holder has shares, price raised by the top-up
+[06:14:32] placed 4000 orders in 109.0s (36.7 orders/s)
+[06:14:38] settling the backlog
+[06:15:51] settled 4000 orders in 73.2s: 54.63 orders/s, 20 batches
+[06:16:05] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[06:16:12] DARs uploaded to both participants
+[06:21:58] vault open: sharded, shards 1, 40 holders
+[06:22:16] holders funded
+[06:22:22] seeded: every holder has shares, price raised by the top-up
+[06:24:15] placed 4000 orders in 112.5s (35.6 orders/s)
+[06:24:22] settling the backlog
+[06:25:14] settled 4000 orders in 52.0s: 76.87 orders/s, 20 batches
+[06:25:14] fold took 0.412s
+[06:25:23] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[06:25:32] DARs uploaded to both participants
+[06:31:19] vault open: sharded, shards 2, 40 holders
+[06:31:38] holders funded
+[06:31:46] seeded: every holder has shares, price raised by the top-up
+[06:33:34] placed 4000 orders in 107.9s (37.1 orders/s)
+[06:33:41] settling the backlog
+[06:34:10] settled 4000 orders in 29.2s: 137.21 orders/s, 21 batches
+[06:34:10] fold took 0.407s
+[06:34:19] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[06:34:27] DARs uploaded to both participants
+[06:40:19] vault open: sharded, shards 4, 40 holders
+[06:40:36] holders funded
+[06:40:44] seeded: every holder has shares, price raised by the top-up
+[06:42:34] placed 4000 orders in 110.5s (36.2 orders/s)
+[06:42:41] settling the backlog
+[06:43:01] settled 4000 orders in 20.0s: 199.52 orders/s, 22 batches
+[06:43:02] fold took 0.392s
+[06:43:11] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[06:43:18] DARs uploaded to both participants
+[06:48:58] vault open: sharded, shards 8, 40 holders
+[06:49:16] holders funded
+[06:49:26] seeded: every holder has shares, price raised by the top-up
+[06:51:16] placed 4000 orders in 109.9s (36.4 orders/s)
+[06:51:23] settling the backlog
+[06:51:41] settled 4000 orders in 18.2s: 220.34 orders/s, 24 batches
+[06:51:41] fold took 0.496s
+[06:51:50] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[06:51:59] DARs uploaded to both participants
+[06:57:48] vault open: sharded, shards 16, 40 holders
+[06:58:06] holders funded
+[06:58:19] seeded: every holder has shares, price raised by the top-up
+[07:00:09] placed 4000 orders in 110.2s (36.3 orders/s)
+[07:00:16] settling the backlog
+[07:00:36] settled 4000 orders in 20.0s: 199.68 orders/s, 32 batches
+[07:00:37] fold took 0.524s
+[07:00:46] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[07:00:54] DARs uploaded to both participants
+[07:06:48] vault open: batched, shards 1, 40 holders
+[07:07:05] holders funded
+[07:07:12] seeded: every holder has shares, price raised by the top-up
+[07:09:04] placed 4000 orders in 112.1s (35.7 orders/s)
+[07:09:11] settling the backlog
+[07:10:23] settled 4000 orders in 72.0s: 55.54 orders/s, 20 batches
+[07:10:36] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[07:10:44] DARs uploaded to both participants
+[07:16:43] vault open: sharded, shards 1, 40 holders
+[07:17:01] holders funded
+[07:17:07] seeded: every holder has shares, price raised by the top-up
+[07:18:58] placed 4000 orders in 110.2s (36.3 orders/s)
+[07:19:05] settling the backlog
+[07:20:00] settled 4000 orders in 54.8s: 72.96 orders/s, 20 batches
+[07:20:00] fold took 0.427s
+[07:20:09] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[07:20:17] DARs uploaded to both participants
+[07:26:01] vault open: sharded, shards 2, 40 holders
+[07:26:19] holders funded
+[07:26:26] seeded: every holder has shares, price raised by the top-up
+[07:28:16] placed 4000 orders in 110.4s (36.2 orders/s)
+[07:28:23] settling the backlog
+[07:28:56] settled 4000 orders in 32.7s: 122.48 orders/s, 21 batches
+[07:28:56] fold took 0.422s
+[07:29:05] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[07:29:14] DARs uploaded to both participants
+[07:35:03] vault open: sharded, shards 4, 40 holders
+[07:35:21] holders funded
+[07:35:29] seeded: every holder has shares, price raised by the top-up
+[07:37:19] placed 4000 orders in 110.3s (36.3 orders/s)
+[07:37:26] settling the backlog
+[07:37:47] settled 4000 orders in 20.9s: 191.68 orders/s, 21 batches
+[07:37:47] fold took 0.397s
+[07:37:56] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[07:38:04] DARs uploaded to both participants
+[07:43:53] vault open: sharded, shards 8, 40 holders
+[07:44:11] holders funded
+[07:44:20] seeded: every holder has shares, price raised by the top-up
+[07:46:10] placed 4000 orders in 109.6s (36.5 orders/s)
+[07:46:17] settling the backlog
+[07:46:37] settled 4000 orders in 20.6s: 194.18 orders/s, 24 batches
+[07:46:38] fold took 0.541s
+[07:46:47] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
+[07:46:56] DARs uploaded to both participants
+[07:52:24] vault open: sharded, shards 16, 40 holders
+[07:52:43] holders funded
+[07:52:56] seeded: every holder has shares, price raised by the top-up
+[07:54:47] placed 4000 orders in 111.0s (36.1 orders/s)
+[07:54:54] settling the backlog
+[07:55:16] settled 4000 orders in 21.4s: 186.51 orders/s, 32 batches
+[07:55:16] fold took 0.545s
+[07:55:25] balance check: {'ok': True, 'assets': '5300.0000000000', 'reserved': '5300.0000000000', 'issued': '4818.1818180000', 'shares': '4818.1818180000'}
